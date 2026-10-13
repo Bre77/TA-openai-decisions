@@ -1,0 +1,103 @@
+# Publish a GitHub Release when a v<version> tag is pushed. The tag must match
+# the app version. Before anything is published, the released package is built
+# and AppInspected (precert, and the Splunk Cloud cloud and aarch64_compatibility
+# tags) by _build.yml, and the fleet's reusable build + AppInspect (precert,
+# cloud and self-service on its own ucc-gen build) must pass too; its reports
+# are attached alongside ours. Uploading to Splunkbase stays a
+# manual step: this workflow needs no Splunkbase or other external credentials.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+
+jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag matches the app version
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          config=$(python3 -c 'import json; print(json.load(open("globalConfig.json"))["meta"]["version"])')
+          manifest=$(python3 -c 'import json; print(json.load(open("package/app.manifest"))["info"]["id"]["version"])')
+          echo "tag=$tag globalConfig.json=$config package/app.manifest=$manifest"
+          if [ "$tag" != "$config" ] || [ "$tag" != "$manifest" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match the app version (globalConfig.json $config, package/app.manifest $manifest)"
+            exit 1
+          fi
+
+  build:
+    needs: check-version
+    uses: ./.github/workflows/_build.yml
+
+  fleet-appinspect:
+    needs: check-version
+    uses: Bre77/splunk_nats/.github/workflows/_reusable-build-appinspect.yml@main
+    with:
+      app_dir: "."
+      use_ucc_gen: true
+      splunk_python_version: "3.9"
+      fail_on: "errors"
+
+  release:
+    needs: [build, fleet-appinspect]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.build.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/scripts
+      - uses: actions/download-artifact@v4
+        with:
+          name: TA-openai-decisions-${{ needs.build.outputs.version }}
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: App-Inspect-Reports-*
+          path: fleet
+          merge-multiple: true
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          pkg="TA-openai-decisions-$VERSION.tar.gz"
+          mv "dist/$pkg" .
+          sha256sum "$pkg" > "$pkg.sha256"
+          # Drop the fleet reports' build-number prefix, e.g.
+          # TA-openai-decisions_1_0_0_1791850620_cloud_inspect_check.json -> fleet-cloud_inspect_check.json
+          fleet=()
+          for f in fleet/*_inspect_check.json fleet/*_inspect_check.html; do
+            new="$(basename "$f" | sed -E 's/^.*_[0-9]+_([a-z]+_inspect_check\.[a-z]+)$/fleet-\1/')"
+            mv "$f" "$new"
+            fleet+=("$new")
+          done
+          test "${#fleet[@]}" -eq 6
+          {
+            echo "Splunk add-on package for TA-openai-decisions $VERSION, built from $GITHUB_SHA."
+            echo
+            echo "To publish, download \`$pkg\` and upload it to Splunkbase by hand."
+            echo
+            echo "SHA-256: \`$(cut -d' ' -f1 "$pkg.sha256")\`"
+            echo
+            cat appinspect/summary.md
+            echo
+            echo "The released package above is the one to upload. The fleet reports below are for the same commit, built separately by the fleet's reusable workflow."
+            echo
+            python3 .github/scripts/appinspect_gate.py --title "Fleet AppInspect" fleet-*.json
+          } > notes.md
+          prerelease=()
+          case "$VERSION" in *-*) prerelease=(--prerelease) ;; esac
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --title "$VERSION" --notes-file notes.md "${prerelease[@]}" \
+            "$pkg" "$pkg.sha256" appinspect/appinspect-precert.json appinspect/appinspect-cloud.json "${fleet[@]}"

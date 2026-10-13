@@ -1,0 +1,68 @@
+# Build the add-on with the pinned ucc-gen and run local AppInspect on the
+# package: precert mode, plus the Splunk Cloud vetting tags. Called by
+# validate.yml on every push/PR and by release.yml before publishing.
+# Credential-free by design.
+name: Build
+
+on:
+  workflow_call:
+    outputs:
+      version:
+        description: "App version from globalConfig.json meta.version."
+        value: ${{ jobs.build.outputs.version }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+      - name: Install ucc-gen and AppInspect
+        run: python -m pip install splunk-add-on-ucc-framework==6.5.3 splunk-appinspect==4.3.1
+      - name: Read the app version
+        id: version
+        run: echo "version=$(python -c 'import json; print(json.load(open("globalConfig.json"))["meta"]["version"])')" >> "$GITHUB_OUTPUT"
+      - name: Build and package
+        # build.sh fails on any native library in the vendored lib/.
+        run: ./build.sh "${{ steps.version.outputs.version }}"
+      - name: Check the build
+        run: |
+          set -euo pipefail
+          app=output/TA-openai-decisions
+          git diff --exit-code globalConfig.json
+          ls "$app"/lib/splunk_sdk-2.*.dist-info >/dev/null
+          grep -q '^python.required = 3.9, 3.13$' "$app/default/commands.conf"
+          grep -q '^python.required = 3.9, 3.13$' "$app/default/restmap.conf"
+          test -f "dist/TA-openai-decisions-${{ steps.version.outputs.version }}.tar.gz"
+      - name: AppInspect (precert and Splunk Cloud tags)
+        run: |
+          set -euo pipefail
+          pkg="dist/TA-openai-decisions-${{ steps.version.outputs.version }}.tar.gz"
+          mkdir -p appinspect
+          # inspect exits non-zero on findings; the gate script decides pass/fail.
+          splunk-appinspect inspect "$pkg" --mode precert \
+            --data-format json --output-file appinspect/appinspect-precert.json || true
+          splunk-appinspect inspect "$pkg" --mode precert \
+            --included-tags cloud --included-tags aarch64_compatibility \
+            --data-format json --output-file appinspect/appinspect-cloud.json || true
+          python .github/scripts/appinspect_gate.py --title "AppInspect (released package)" \
+            appinspect/appinspect-precert.json appinspect/appinspect-cloud.json \
+            > appinspect/summary.md || status=$?
+          cat appinspect/summary.md >> "$GITHUB_STEP_SUMMARY"
+          exit "${status:-0}"
+      - name: Upload package and AppInspect reports
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: TA-openai-decisions-${{ steps.version.outputs.version }}
+          path: |
+            dist/TA-openai-decisions-${{ steps.version.outputs.version }}.tar.gz
+            appinspect/
+          if-no-files-found: error

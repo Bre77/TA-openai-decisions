@@ -14,7 +14,7 @@ The OpenAI Decisions API is in public beta. This add-on uses its `predicate` que
 
 ## Install
 
-1. Download the package (`TA-openai-decisions-<version>.tar.gz`) from a CI run, or build it yourself (see [Development](#development)).
+1. Download the package (`TA-openai-decisions-<version>.tar.gz`) from a [GitHub Release](https://github.com/Bre77/TA-openai-decisions/releases), or build it yourself (see [Development](#development)).
 2. Install it on your search heads: **Apps > Manage Apps > Install app from file**, or `splunk install app TA-openai-decisions-<version>.tar.gz`.
 3. Restart Splunk.
 
@@ -152,6 +152,24 @@ The unit tests use a local stand-in for the Decisions API, `tests/stub_decisions
 ```bash
 tests/e2e/splunk_e2e.sh <container> dist/TA-openai-decisions-1.0.0.tar.gz
 ```
+
+## Releasing
+
+Pushing a `v<version>` tag runs `.github/workflows/release.yml`. It checks that the tag matches the version in `globalConfig.json` and `package/app.manifest`, builds the package and runs AppInspect on it (precert, and the Splunk Cloud `cloud` and `aarch64_compatibility` tags), and runs the fleet's reusable build and AppInspect. Only if no check has an error or failure does it publish a GitHub Release with the package, its `.sha256` checksum and the AppInspect reports (the fleet's are prefixed `fleet-`). Warnings don't block a release. A version with a hyphen, such as `1.1.0-rc.1`, is published as a pre-release. The workflow never uploads to Splunkbase.
+
+1. Bump `meta.version` in `globalConfig.json` and `info.id.version` in `package/app.manifest`, and merge that to `main`.
+2. Tag the merge commit and push the tag:
+
+   ```bash
+   git checkout main && git pull
+   git tag v1.1.0
+   git push origin v1.1.0
+   ```
+
+3. When the Release workflow is green, download `TA-openai-decisions-<version>.tar.gz` from the new [release](https://github.com/Bre77/TA-openai-decisions/releases).
+4. Upload it to Splunkbase by hand.
+
+If the workflow fails, fix the cause on `main`, delete the tag (`git push origin :v1.1.0 && git tag -d v1.1.0`) and tag again.
 
 ## License
 
