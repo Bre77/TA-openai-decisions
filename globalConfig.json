@@ -213,7 +213,7 @@
     "meta": {
         "name": "TA-openai-decisions",
         "restRoot": "ta_openai_decisions",
-        "version": "1.1.0",
+        "version": "1.1.1",
         "displayName": "OpenAI Decisions Add-on",
         "schemaVersion": "0.0.10",
         "defaultView": "configuration",
