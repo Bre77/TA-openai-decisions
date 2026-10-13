@@ -51,7 +51,8 @@ def cache_key(model, prompt, text):
 class KVStoreCache:
     """Batched lookups and writes against the cache collection.
 
-    Any KV store failure is logged and degrades to calling the API: a failed
+    Any KV store failure is logged, passed to ``warn`` (the search command
+    shows it as a search warning), and degrades to calling the API: a failed
     lookup disables lookups for the rest of the search, a failed write
     disables writes (for example when the user's role can read but not write
     the collection).
@@ -64,12 +65,14 @@ class KVStoreCache:
         max_entries=DEFAULT_MAX_ENTRIES,
         logger=None,
         clock=time.time,
+        warn=None,
     ):
         self._data = data
         self._ttl = float(ttl_days) * 86400
         self._max_entries = max_entries
         self._log = logger or logging.getLogger(__name__)
         self._clock = clock
+        self._warn = warn
         self._can_read = True
         self._can_write = True
 
@@ -79,6 +82,8 @@ class KVStoreCache:
         if not keys or not self._can_read:
             return {}
         cutoff = self._clock() - self._ttl
+        # No "fields" projection: Splunk 10.4 rejects a list there and 10.6 a
+        # comma-separated string, and the documents are small anyway.
         queries = [
             {
                 "query": {
@@ -87,7 +92,6 @@ class KVStoreCache:
                         {"created": {"$gte": cutoff}},
                     ]
                 },
-                "fields": ["_key", "probability"],
                 "limit": LOOKUP_GROUP_SIZE,
             }
             for i in range(0, len(keys), LOOKUP_GROUP_SIZE)
@@ -96,7 +100,7 @@ class KVStoreCache:
             results = self._data.batch_find(*queries)
         except Exception as e:
             self._can_read = False
-            self._log.warning("decide cache lookup failed, continuing without it: %s", e)
+            self._failed("decide cache lookup failed, continuing without it", e)
             return {}
         hits = {}
         for group in results:
@@ -122,7 +126,7 @@ class KVStoreCache:
                 self._data.batch_save(*batch)
             except Exception as e:
                 self._can_write = False
-                self._log.warning("decide cache write failed, not caching further results: %s", e)
+                self._failed("decide cache write failed, not caching further results", e)
                 break
             written += len(batch)
         return written
@@ -139,7 +143,23 @@ class KVStoreCache:
                 created = newest_excess[0].get("created")
                 self._data.delete(query=json.dumps({"created": {"$lte": created}}))
         except Exception as e:
-            self._log.debug("decide cache purge skipped: %s", e)
+            self._failed("decide cache purge failed, old entries were not removed", e)
+
+    def _failed(self, what, error):
+        message = f"{what}: {describe_error(error)}"
+        self._log.warning(message)
+        if self._warn is not None:
+            self._warn(message)
+
+
+def describe_error(error):
+    """``str(error)``, without the repeat in a splunklib HTTPError whose reason
+    phrase is the KV store's message ("HTTP 403 <message> -- <message>")."""
+    text = str(error)
+    status, reason = getattr(error, "status", None), getattr(error, "reason", None)
+    if reason and text == f"HTTP {status} {reason} -- {reason}":
+        return f"HTTP {status} {reason}"
+    return text
 
 
 def _probability(value):

@@ -40,7 +40,7 @@ Open **OpenAI Decisions Add-on > Configuration**:
 
 Reading the stored API key requires the `list_storage_passwords` capability, which `admin` and `sc_admin` have by default. To let other users run `decide`, give their role that capability. This also limits who can spend API credits.
 
-To write to the result cache, a role also needs write access to the add-on's `ta_openai_decisions_cache` KV store collection (by default `admin` and `sc_admin`). Users who can only read the collection still get cache hits, but their new results aren't cached.
+To write to the result cache, a role also needs write access to the add-on's `ta_openai_decisions_cache` KV store collection (by default `admin` and `sc_admin`). Users who can only read the collection still get cache hits, but their new results aren't cached, and their searches show `decide cache purge failed` and `decide cache write failed` warnings.
 
 ## Usage
 
@@ -127,6 +127,7 @@ index=web
 
 - `decide: no OpenAI API key is configured`: set the key on the Configuration page.
 - `decide: could not read the add-on settings ... list_storage_passwords`: your role can't read the stored API key. See [Permissions](#permissions).
+- `decide cache lookup failed`, `decide cache write failed`, `decide cache purge failed` or `decide cache unavailable`: a KV store request for the result cache failed, and the message ends with the KV store's error. The search still completes, but without that part of the cache, so events that could have been cache hits are sent to the API.
 - Per-event errors, cache statistics, and each search's settings are logged to `$SPLUNK_HOME/var/log/splunk/ta_openai_decisions_decide.log`, which is indexed in `_internal`:
 
   ```spl
@@ -159,7 +160,7 @@ pytest
 ruff check package/bin tests && ruff format --check package/bin tests
 ```
 
-The unit tests use a local stand-in for the Decisions API, `tests/stub_decisions_api.py`, and an in-memory KV store. `tests/e2e/splunk_e2e.sh` installs a built package into a running `splunk/splunk` container (admin password `devcontainer`), points the add-on at the stub, and checks the command end to end, including the cache:
+The unit tests use a local stand-in for the Decisions API, `tests/stub_decisions_api.py`, and an in-memory KV store. `tests/e2e/splunk_e2e.sh` installs a built package into a running `splunk/splunk` container (admin password `devcontainer`), points the add-on at the stub, and checks the command end to end, including the cache. The KV store REST API differs between Splunk versions, so run it on the oldest and the newest supported Splunk:
 
 ```bash
 tests/e2e/splunk_e2e.sh <container> dist/TA-openai-decisions-1.1.0.tar.gz

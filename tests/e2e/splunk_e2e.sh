@@ -6,11 +6,15 @@
 #
 # The container must be a healthy docker.io/splunk/splunk with admin password
 # "devcontainer" (e.g. SplunkUI-devcontainer's test-harness container). The
-# script installs the package, restarts Splunk, and asserts the decide
-# command's behaviour: the positional and prompt= forms of the prompt,
-# probabilities, per-event errors that do not stop the search, the where-clause
-# filter, field/output options, the KV store cache and decision_from_cache, an
-# invalid key short-circuit, and that the API key never reaches a log.
+# KV store REST API differs between Splunk versions (10.4 and 10.6 accept
+# different batch_find "fields" encodings), so run it on the oldest and the
+# newest supported version. The script installs the package, restarts Splunk,
+# and asserts the decide command's behaviour: the positional and prompt= forms
+# of the prompt, probabilities, per-event errors that do not stop the search,
+# the where-clause filter, field/output options, the KV store cache and
+# decision_from_cache (including after a transforming command over indexed
+# events, and for a role that can read but not write the cache), an invalid
+# key short-circuit, and that the API key never reaches a log.
 set -euo pipefail
 
 CONTAINER="${1:?usage: splunk_e2e.sh <container> <package.tar.gz>}"
@@ -143,9 +147,76 @@ expect "repeat run: decision_from_cache true on cache hits, false on errors" \
   '[r.get("decision_from_cache") for r in rows] == ["true","true","false","false","true","false"]' "$rows"
 expect "only uncached failures hit the API" \
   'data["by_input"] == {"REFUSE this": 1, "HTTP500 boom": 3, "BADJSON": 1}' "$rows" "$stats"
+expect "repeat run: no cache warnings" 'not any("decide cache" in m["text"] for m in messages)' "$rows"
 kv="$(rest GET "/servicesNS/nobody/$APP/storage/collections/data/ta_openai_decisions_cache?output_mode=json")"
 expect "KV store holds exactly the 2 successful results (expired entry purged)" \
   'len(data) == 2 and sorted(d["probability"] for d in data) == [0.05, 0.95] and all(len(d["_key"]) == 64 and d["created"] > 0 for d in data)' "" "$kv"
+
+log "decide after a transforming command over indexed events: a repeat run is served from the cache"
+# The shape of a real search that reported no cache hits on Splunk 10.4:
+# index=... | rex | top 100 input | decide ... field=input
+SRC="e2e_syscall_$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')"
+for _ in 1 2 3; do
+  for input in "process=/usr/bin/curl parent=bash user=www uid=33 cwd=/tmp/" \
+    "process=/bin/sh parent=cron user=root uid=0 cwd=/root/" \
+    "process=/usr/bin/sudo parent=bash user=bob uid=1000 cwd=/home/bob/ result=denied"; do
+    rest POST "/services/receivers/simple?index=main&sourcetype=e2e_syscall&source=$SRC" \
+      --data-binary "$(date -u +%Y-%m-%dT%H:%M:%SZ) e2ehost $input" -o /dev/null
+  done
+done
+for _ in $(seq 30); do
+  indexed="$(search "search index=main source=$SRC | stats count" | python3 -c 'import json,sys; print(json.loads(sys.stdin.readline())["count"])' 2>/dev/null || true)"
+  [ "$indexed" = 9 ] && break
+  sleep 2
+done
+[ "$indexed" = 9 ] && pass "9 syscall events indexed" || fail "9 syscall events indexed (got ${indexed:-none})"
+SYSCALL='search index=main source='"$SRC"' | rex "\S+ \S+ (?<input>.*)" | top 100 input
+| decide "Is this process execution dangerous?" field=input
+| table input count decision_probability decision_error decision_from_cache'
+stub_reset
+rows="$(search "$SYSCALL")"
+printf '%s\n' "$rows"
+stats="$(stub_stats)"
+expect "top: first run decides the 3 distinct inputs, none from the cache" \
+  'len(rows) == 3 and all(r["count"] == "3" and r.get("decision_probability") and r.get("decision_from_cache") == "false" for r in rows)' "$rows"
+expect "top: first run calls the API once per input" 'data["requests"] == 3' "$rows" "$stats"
+expect "top: first run has no cache warnings" 'not any("decide cache" in m["text"] for m in messages)' "$rows"
+first="$(printf '%s\n' "$rows" | python3 -c '
+import json, sys
+rows = [json.loads(l) for l in sys.stdin if l.strip()]
+print(json.dumps({r["input"]: r.get("decision_probability") for r in rows if "input" in r}))')"
+stub_reset
+rows="$(search "$SYSCALL")"
+printf '%s\n' "$rows"
+stats="$(stub_stats)"
+expect "top: repeat run has decision_from_cache true on every row" \
+  'len(rows) == 3 and all(r.get("decision_from_cache") == "true" for r in rows)' "$rows"
+expect "top: repeat run returns the same probabilities" \
+  '{r["input"]: r.get("decision_probability") for r in rows} == data' "$rows" "$first"
+expect "top: repeat run makes no API calls" 'data["requests"] == 0' "$rows" "$stats"
+expect "top: repeat run has no cache warnings" 'not any("decide cache" in m["text"] for m in messages)' "$rows"
+
+log "decide: a role that can read but not write the cache gets hits, and a warning instead of a silent write failure"
+# solnlib's settings reader also needs list_settings (it reads server.conf [sslConfig]).
+rest POST /services/authorization/roles -d name=e2e_decide -o /dev/null
+rest POST /services/authorization/roles/e2e_decide -d imported_roles=user \
+  -d capabilities=list_storage_passwords -d capabilities=list_settings -o /dev/null
+rest POST /services/authentication/users -d name=e2edecide -d password=devcontainer1 \
+  -d roles=e2e_decide -o /dev/null || true
+stub_reset
+rows="$(search "$SYSCALL" e2edecide:devcontainer1)"
+stats="$(stub_stats)"
+expect "read-only role: cache hits" 'len(rows) == 3 and all(r.get("decision_from_cache") == "true" for r in rows)' "$rows"
+expect "read-only role: no API calls for cached inputs" 'data["requests"] == 0' "$rows" "$stats"
+stub_reset
+rows="$(search "| makeresults | eval _raw=\"read-only role $SRC\" | decide \"Is this a failed login?\" | table decision_probability decision_from_cache" e2edecide:devcontainer1)"
+printf '%s\n' "$rows"
+expect "read-only role: a new input is decided" \
+  'len(rows) == 1 and rows[0].get("decision_probability") == "0.05" and rows[0].get("decision_from_cache") == "false"' "$rows"
+expect "read-only role: the failed cache write and purge are search warnings" \
+  'sorted(m["text"].split(":")[0] for m in messages if m["text"].startswith("decide cache")) == ["decide cache purge failed, old entries were not removed", "decide cache write failed, not caching further results"]' "$rows"
+expect "read-only role: each warning quotes the KV store error once" \
+  'all(m["text"].count("cannot write") == 1 for m in messages if m["text"].startswith("decide cache"))' "$rows"
 
 log "decide: cache=false bypasses the cache"
 stub_reset
