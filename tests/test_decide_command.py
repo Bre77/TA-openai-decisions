@@ -2,6 +2,8 @@ import io
 import json
 import logging
 import re
+import time
+import types
 
 import pytest
 
@@ -226,6 +228,65 @@ def test_from_cache_field_only_when_the_cache_is_enabled(kv):
     command = make_command()
     out = list(command.stream([{"_raw": "fresh fail"}]))
     assert "decision_from_cache" not in out[0]
+
+
+def start_with_cache(monkeypatch, service):
+    """A command that builds its KV store cache in _start(), as on the first chunk."""
+    monkeypatch.setattr(decide.splunk_client, "Service", service)
+    command = make_command()
+    command._use_cache = True
+    command._evaluator = None
+    command._start_args = (FakeClient(), 1, 7, 1000, False)
+    command._metadata = types.SimpleNamespace(
+        searchinfo=types.SimpleNamespace(
+            splunkd_uri="https://127.0.0.1:8089", session_key="s", sid="1"
+        )
+    )
+    return command
+
+
+def test_cache_hits_through_the_kv_store_wiring(monkeypatch, kv):
+    from decision_cache import COLLECTION, cache_key
+
+    key = cache_key("gpt-6-luna", "q", "cached fail")
+    kv.docs[key] = {"_key": key, "probability": 0.75, "created": time.time()}
+    service = types.SimpleNamespace(kvstore={COLLECTION: types.SimpleNamespace(data=kv)})
+    command = start_with_cache(monkeypatch, lambda **kwargs: service)
+    command.prompt = "q"
+    out = list(command.stream([{"_raw": "cached fail"}, {"_raw": "fresh fail"}]))
+    assert [(r["decision_probability"], r["decision_from_cache"]) for r in out] == [
+        (0.75, "true"),
+        (0.9, "false"),
+    ]
+    assert command.warnings == []
+
+
+def test_cache_failures_are_search_warnings(monkeypatch, kv, caplog):
+    from decision_cache import COLLECTION
+
+    kv.fail = {"batch_find"}
+    service = types.SimpleNamespace(kvstore={COLLECTION: types.SimpleNamespace(data=kv)})
+    command = start_with_cache(monkeypatch, lambda **kwargs: service)
+    with caplog.at_level(logging.WARNING, logger="test"):
+        out = list(command.stream([{"_raw": "login fail"}]))
+    assert out[0]["decision_probability"] == 0.9
+    assert out[0]["decision_from_cache"] == "false"
+    message = "decide cache lookup failed, continuing without it: kvstore batch_find unavailable"
+    assert command.warnings == [message]
+    assert message in [r.getMessage() for r in caplog.records]
+
+
+def test_unavailable_cache_is_a_search_warning(monkeypatch, caplog):
+    def service(**kwargs):
+        raise OSError("connection refused")
+
+    command = start_with_cache(monkeypatch, service)
+    with caplog.at_level(logging.WARNING, logger="test"):
+        out = list(command.stream([{"_raw": "login fail"}]))
+    assert (out[0]["decision_probability"], out[0]["decision_from_cache"]) == (0.9, "false")
+    message = "decide cache unavailable, continuing without it: connection refused"
+    assert command.warnings == [message]
+    assert message in [r.getMessage() for r in caplog.records]
 
 
 def test_ui_warnings_are_capped():

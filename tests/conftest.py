@@ -44,10 +44,19 @@ class FakeKVData:
         self._check("batch_find")
         results = []
         for q in queries:
-            # The real endpoint rejects a comma-separated string here.
             assert set(q) <= {"query", "fields", "limit"}
-            assert isinstance(q.get("fields", []), list)
-            matched = [dict(d) for d in self.docs.values() if _match(d, q["query"])]
+            fields = q.get("fields")
+            # Splunk 10.4 accepts only a projection object here; 10.6 also takes
+            # a list, but neither takes a comma-separated string.
+            if fields is not None and not isinstance(fields, dict):
+                raise RuntimeError(
+                    "HTTP 400 Bad Request -- The provided 'fields' argument is invalid."
+                )
+            matched = [
+                {k: v for k, v in d.items() if fields is None or fields.get(k)}
+                for d in self.docs.values()
+                if _match(d, q["query"])
+            ]
             results.append(matched[: q.get("limit") or None])
         return results
 

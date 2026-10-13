@@ -1,5 +1,11 @@
+import io
+import logging
+import types
+
+from splunklib import binding
+
 from conftest import API_KEY
-from decision_cache import KVStoreCache, cache_key
+from decision_cache import KVStoreCache, cache_key, describe_error
 from openai_decisions import DecisionsClient, Evaluator
 
 DAY = 86400.0
@@ -147,15 +153,33 @@ def test_inputs_already_decided_in_this_search_skip_the_lookup(stub, kv):
     assert kv.calls == []
 
 
-def test_kv_store_failures_degrade_to_the_api(stub, kv):
+def test_lookup_query_is_accepted_by_splunk_10_4_and_10_6(kv):
+    # A "fields" list in batch_find gets HTTP 400 on Splunk 10.4, which turned
+    # every lookup into a miss while writes still succeeded.
+    key = cache_key("gpt-6-luna", "q", "text")
+    kv.docs[key] = {"_key": key, "probability": 0.75, "created": 1000 * DAY}
+    warnings = []
+    cache = KVStoreCache(kv, clock=Clock(), warn=warnings.append)
+    assert cache.lookup([key, cache_key("gpt-6-luna", "q", "other")]) == {key: 0.75}
+    assert warnings == []
+
+
+def test_kv_store_failures_degrade_to_the_api_with_a_warning(stub, kv, caplog):
     kv.fail = {"batch_find", "batch_save"}
-    cache = KVStoreCache(kv)
+    warnings = []
+    cache = KVStoreCache(kv, logger=logging.getLogger("test"), warn=warnings.append)
     evaluator = make_evaluator(stub, cache)
-    assert run(evaluator, ["login failed"]) == [(0.95, None)]
-    assert run(evaluator, ["all good"]) == [(0.05, None)]
+    with caplog.at_level(logging.WARNING, logger="test"):
+        assert run(evaluator, ["login failed"]) == [(0.95, None)]
+        assert run(evaluator, ["all good"]) == [(0.05, None)]
     # Each failing operation is tried once, then disabled for the search.
     assert kv.calls == ["batch_find", "batch_save"]
     assert evaluator.stats["cached"] == 0
+    assert warnings == [
+        "decide cache lookup failed, continuing without it: kvstore batch_find unavailable",
+        "decide cache write failed, not caching further results: kvstore batch_save unavailable",
+    ]
+    assert [r.getMessage() for r in caplog.records] == warnings
 
 
 def test_purge_removes_expired_and_excess_entries(kv):
@@ -171,6 +195,32 @@ def test_purge_removes_expired_and_excess_entries(kv):
     assert sorted(kv.docs) == ["k1", "k2", "k3"]
 
 
-def test_purge_failure_is_not_raised(kv):
+def kv_store_http_error(status, reason, message):
+    response = types.SimpleNamespace(
+        status=status,
+        reason=reason,
+        headers=[],
+        body=io.BytesIO(
+            f'<response><messages><msg type="ERROR">{message}</msg></messages></response>'.encode()
+        ),
+    )
+    return binding.HTTPError(response)
+
+
+def test_describe_error_drops_the_repeated_kv_store_message():
+    denied = "User 'bob' with roles { user } cannot write: /nobody/app/collections/c"
+    assert describe_error(kv_store_http_error(403, denied, denied)) == f"HTTP 403 {denied}"
+    invalid = kv_store_http_error(400, "Bad Request", "The provided 'fields' argument is invalid.")
+    assert describe_error(invalid) == (
+        "HTTP 400 Bad Request -- The provided 'fields' argument is invalid."
+    )
+    assert describe_error(OSError("connection refused")) == "connection refused"
+
+
+def test_purge_failure_is_a_warning_not_an_exception(kv):
     kv.fail = {"delete"}
-    KVStoreCache(kv).purge()
+    warnings = []
+    KVStoreCache(kv, warn=warnings.append).purge()
+    assert warnings == [
+        "decide cache purge failed, old entries were not removed: kvstore delete unavailable"
+    ]

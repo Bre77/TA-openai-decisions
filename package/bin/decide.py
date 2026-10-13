@@ -39,7 +39,13 @@ from solnlib.utils import is_true
 from splunklib import client as splunk_client
 from splunklib.searchcommands import Configuration, Option, StreamingCommand, dispatch, validators
 
-from decision_cache import COLLECTION, DEFAULT_MAX_ENTRIES, DEFAULT_TTL_DAYS, KVStoreCache
+from decision_cache import (
+    COLLECTION,
+    DEFAULT_MAX_ENTRIES,
+    DEFAULT_TTL_DAYS,
+    KVStoreCache,
+    describe_error,
+)
 from openai_decisions import DEFAULT_MODEL, DecisionsClient, Evaluator
 
 APP_NAME = "TA-openai-decisions"
@@ -272,11 +278,23 @@ class DecideCommand(StreamingCommand):
             )
             data = service.kvstore[COLLECTION].data
         except Exception as e:
-            self._log.warning("decide cache unavailable, continuing without it: %s", e)
+            message = f"decide cache unavailable, continuing without it: {describe_error(e)}"
+            self._log.warning(message)
+            self._warn_cache(message)
             return None
-        cache = KVStoreCache(data, ttl_days=ttl_days, max_entries=max_entries, logger=self._log)
+        cache = KVStoreCache(
+            data,
+            ttl_days=ttl_days,
+            max_entries=max_entries,
+            logger=self._log,
+            warn=self._warn_cache,
+        )
         cache.purge()
         return cache
+
+    def _warn_cache(self, message):
+        # The cache only saves API calls, so its failures are search warnings, not errors.
+        self.write_warning("{}", message)
 
     def stream(self, records):
         if self._evaluator is None:
