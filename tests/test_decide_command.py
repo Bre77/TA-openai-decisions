@@ -1,19 +1,18 @@
-import io
-import json
 import logging
-import re
 import time
 import types
 
 import pytest
 
+import conftest
 import decide
-from openai_decisions import Evaluator
+import decisions_command
+from openai_decisions import Evaluator, Predicate
 
 
 def test_proxy_disabled():
-    assert decide.build_proxies({}) is None
-    assert decide.build_proxies({"proxy_enabled": "0", "proxy_url": "proxy"}) is None
+    assert decisions_command.build_proxies({}) is None
+    assert decisions_command.build_proxies({"proxy_enabled": "0", "proxy_url": "proxy"}) is None
 
 
 @pytest.mark.parametrize(
@@ -34,7 +33,7 @@ def test_proxy_schemes(proxy_type, rdns, scheme):
     if rdns:
         proxy["proxy_rdns"] = rdns
     url = f"{scheme}://proxy.example.com:3128"
-    assert decide.build_proxies(proxy) == {"http": url, "https": url}
+    assert decisions_command.build_proxies(proxy) == {"http": url, "https": url}
 
 
 def test_proxy_credentials_are_url_encoded():
@@ -46,12 +45,12 @@ def test_proxy_credentials_are_url_encoded():
         "proxy_password": "p@ss:word/",
     }
     url = "http://dom%5Cuser:p%40ss%3Aword%2F@10.0.0.1:8080"
-    assert decide.build_proxies(proxy) == {"http": url, "https": url}
+    assert decisions_command.build_proxies(proxy) == {"http": url, "https": url}
 
 
 def test_enabled_proxy_needs_host_and_port():
-    with pytest.raises(decide.SettingsError):
-        decide.build_proxies({"proxy_enabled": "1", "proxy_url": "proxy"})
+    with pytest.raises(decisions_command.SettingsError):
+        decisions_command.build_proxies({"proxy_enabled": "1", "proxy_url": "proxy"})
 
 
 class FakeClient:
@@ -82,49 +81,8 @@ def make_command(**options):
     return command
 
 
-def splunk_args(raw_args):
-    """The args Splunk derives from raw_args, as observed on Splunk 10: quotes
-    around a whole argument or an option value are removed."""
-    return [re.sub(r'^(\w+=)?"(.*)"$', r"\1\2", arg, flags=re.S) for arg in raw_args]
-
-
 def run_getinfo(monkeypatch, raw_args):
-    """Run the protocol v2 getinfo exchange the way splunkd starts the command,
-    and return the command and the error messages it wrote."""
-    monkeypatch.setattr(
-        decide,
-        "load_settings",
-        lambda key: {"openai": {"api_key": "k"}, "cache": {}, "proxy": {}, "logging": {}},
-    )
-    monkeypatch.setattr(decide, "_make_logger", lambda level: logging.getLogger("test"))
-    searchinfo = {
-        "args": splunk_args(raw_args),
-        "raw_args": raw_args,
-        "session_key": "s",
-        "sid": "1",
-        "app": "search",
-        "owner": "admin",
-        "username": "admin",
-        "search": "| decide",
-        "splunk_version": "10.0.0",
-        "earliest_time": "0",
-        "latest_time": "0",
-        "dispatch_dir": "/tmp",
-        "splunkd_uri": "https://127.0.0.1:8089",
-    }
-    metadata = json.dumps({"action": "getinfo", "preview": False, "searchinfo": searchinfo})
-    ifile = io.BytesIO(f"chunked 1.0,{len(metadata)},0\n{metadata}".encode())
-    ofile = io.BytesIO()
-    command = decide.DecideCommand()
-    try:
-        command.process(["decide.py"], ifile, ofile)
-    except SystemExit:  # the command exits after reporting an error
-        pass
-    header, _, body = ofile.getvalue().decode().partition("\n")
-    messages = (
-        json.loads(body[: int(header.split(",")[1])]).get("inspector", {}).get("messages", [])
-    )
-    return command, [text for level, text in messages if level == "ERROR"]
+    return conftest.run_getinfo(monkeypatch, decide.DecideCommand, raw_args)
 
 
 @pytest.mark.parametrize(
@@ -232,10 +190,11 @@ def test_from_cache_field_only_when_the_cache_is_enabled(kv):
 
 def start_with_cache(monkeypatch, service):
     """A command that builds its KV store cache in _start(), as on the first chunk."""
-    monkeypatch.setattr(decide.splunk_client, "Service", service)
+    monkeypatch.setattr(decisions_command.splunk_client, "Service", service)
     command = make_command()
     command._use_cache = True
     command._evaluator = None
+    command._question = Predicate("q")
     command._start_args = (FakeClient(), 1, 7, 1000, False)
     command._metadata = types.SimpleNamespace(
         searchinfo=types.SimpleNamespace(
@@ -252,7 +211,6 @@ def test_cache_hits_through_the_kv_store_wiring(monkeypatch, kv):
     kv.docs[key] = {"_key": key, "probability": 0.75, "created": time.time()}
     service = types.SimpleNamespace(kvstore={COLLECTION: types.SimpleNamespace(data=kv)})
     command = start_with_cache(monkeypatch, lambda **kwargs: service)
-    command.prompt = "q"
     out = list(command.stream([{"_raw": "cached fail"}, {"_raw": "fresh fail"}]))
     assert [(r["decision_probability"], r["decision_from_cache"]) for r in out] == [
         (0.75, "true"),
@@ -293,7 +251,7 @@ def test_ui_warnings_are_capped():
     command = make_command()
     for i in range(10):
         command._report(f"error {i}")
-    assert len(command.warnings) == decide.MAX_UI_WARNINGS
+    assert len(command.warnings) == decisions_command.MAX_UI_WARNINGS
 
 
 def test_repeated_errors_are_logged_once_at_warning(caplog):

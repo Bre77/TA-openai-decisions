@@ -14,7 +14,10 @@
 # the where-clause filter, field/output options, the KV store cache and
 # decision_from_cache (including after a transforming command over indexed
 # events, and for a role that can read but not write the cache), an invalid
-# key short-circuit, and that the API key never reaches a log.
+# key short-circuit, and that the API key never reaches a log. It then checks
+# the choose and grade commands: their output fields, per-event errors, a
+# repeat run served from the cache without touching decide's entries, quoted
+# options as Splunk delivers them, and their argument errors.
 set -euo pipefail
 
 CONTAINER="${1:?usage: splunk_e2e.sh <container> <package.tar.gz>}"
@@ -270,8 +273,104 @@ rows="$(search '| makeresults | decide "q?"' e2euser:devcontainer1)"
 printf '%s\n' "$rows"
 expect "permission error explains the capability" 'any("list_storage_passwords" in m["text"] for m in messages)' "$rows"
 
+log "choose: the chosen option, its probability, and every option's probability"
+# The same prompt and inputs as decide's cached entries above, which must not be reused.
+CHOOSE='| choose "Is this a failed login?" "login failed" "The sign-in attempt failed" "logged in" "The user signed in" other "Anything else"'
+CHOOSE_FIELDS='choice choice_probability choice_confidence choice_probability_login_failed choice_probability_logged_in choice_probability_other choice_error choice_from_cache'
+stub_reset
+rows="$(search "$BASE $CHOOSE | table n $CHOOSE_FIELDS")"
+printf '%s\n' "$rows"
+stats="$(stub_stats)"
+expect "choose: all 6 events returned in order" '[r["n"] for r in rows] == ["1","2","3","4","5","6"]' "$rows"
+expect "choose: chosen options" '[r.get("choice") for r in rows] == ["login failed","logged in",None,None,"login failed",None]' "$rows"
+expect "choose: probability and confidence of the choice" \
+  '[(r.get("choice_probability"), r.get("choice_confidence")) for r in rows] == [("0.8","0.7"),("0.8","0.7"),(None,None),(None,None),("0.8","0.7"),(None,None)]' "$rows"
+expect "choose: every option's probability" \
+  '[(r.get("choice_probability_login_failed"), r.get("choice_probability_logged_in"), r.get("choice_probability_other")) for r in rows] == [("0.8","0.1","0.1"),("0.1","0.8","0.1"),(None,None,None),(None,None,None),("0.8","0.1","0.1"),(None,None,None)]' "$rows"
+expect "choose: errors" '[r.get("choice_error") for r in rows] == [None, None, "refusal", "HTTP 500: The server had an error while processing your request.", None, "invalid response: body is not JSON"]' "$rows"
+expect "choose: decide's cache entries for the same prompt and inputs are not used" \
+  'data["by_input"] == {"user bob login failed": 1, "user alice logged in": 1, "REFUSE this": 1, "HTTP500 boom": 3, "BADJSON": 1}' "$rows" "$stats"
+expect "choose: request body shape" \
+  'all(b["model"] == "gpt-6-luna" and b["questions"] == [{"type": "choice", "name": "decision", "instructions": "Is this a failed login?", "choices": [{"value": "login failed", "description": "The sign-in attempt failed"}, {"value": "logged in", "description": "The user signed in"}, {"value": "other", "description": "Anything else"}]}] for b in data["bodies"])' "$rows" "$stats"
+expect "choose: search warnings surfaced" 'sum("choose: some events could not be decided" in m["text"] for m in messages) == 3' "$rows"
+expect "choose: first run has choice_from_cache false on every event" '[r.get("choice_from_cache") for r in rows] == ["false"] * 6' "$rows"
+first="$(printf '%s\n' "$rows" | python3 -c '
+import json, sys
+lines = [json.loads(l) for l in sys.stdin if l.strip()]
+print(json.dumps([{k: v for k, v in l.items() if k != "choice_from_cache"} for l in lines if "_message" not in l]))')"
+
+log "choose: a repeat run is served from the cache"
+stub_reset
+rows="$(search "$BASE $CHOOSE | table n $CHOOSE_FIELDS")"
+stats="$(stub_stats)"
+expect "choose: repeat run returns the same fields" \
+  '[{k: v for k, v in r.items() if k != "choice_from_cache"} for r in rows] == data' "$rows" "$first"
+expect "choose: repeat run has choice_from_cache true on cache hits, false on errors" \
+  '[r.get("choice_from_cache") for r in rows] == ["true","true","false","false","true","false"]' "$rows"
+expect "choose: only uncached failures hit the API" \
+  'data["by_input"] == {"REFUSE this": 1, "HTTP500 boom": 3, "BADJSON": 1}' "$rows" "$stats"
+expect "choose: repeat run has no cache warnings" 'not any("cache" in m["text"] for m in messages)' "$rows"
+kv="$(rest GET "/servicesNS/nobody/$APP/storage/collections/data/ta_openai_decisions_cache?output_mode=json")"
+expect "choose: KV store holds the 2 choice answers beside decide's entries" \
+  'sorted((d["choice"], json.loads(d["probabilities"]), d["confidence"]) for d in data if "choice" in d) == [("logged in", [0.1, 0.8, 0.1], 0.7), ("login failed", [0.8, 0.1, 0.1], 0.7)] and all(len(d["_key"]) == 64 for d in data)' "" "$kv"
+
+log "choose: output= names the fields, and | where filters on them"
+rows="$(search "$BASE $CHOOSE output=kind | where kind=\"login failed\" AND kind_probability > 0.5 | table n kind kind_probability_other")"
+expect "choose output=: where keeps the two failed logins" \
+  '[(r["n"], r.get("kind"), r.get("kind_probability_other")) for r in rows] == [("1","login failed","0.1"), ("5","login failed","0.1")]' "$rows"
+
+log "grade: the score, its confidence, and every level's probability"
+GRADE='| grade "Is this a failed login?" "logged in" "A routine sign-in" "login failed" "A failed sign-in, worth a look"'
+GRADE_FIELDS='grade grade_confidence grade_probability_logged_in grade_probability_login_failed grade_error grade_from_cache'
+stub_reset
+rows="$(search "$BASE $GRADE | table n $GRADE_FIELDS")"
+printf '%s\n' "$rows"
+stats="$(stub_stats)"
+expect "grade: scores" '[r.get("grade") for r in rows] == ["0.8","0.2",None,None,"0.8",None]' "$rows"
+expect "grade: confidence and every level's probability" \
+  '[(r.get("grade_confidence"), r.get("grade_probability_logged_in"), r.get("grade_probability_login_failed")) for r in rows] == [("0.6","0.2","0.8"),("0.6","0.8","0.2"),(None,None,None),(None,None,None),("0.6","0.2","0.8"),(None,None,None)]' "$rows"
+expect "grade: errors" '[r.get("grade_error") for r in rows] == [None, None, "refusal", "HTTP 500: The server had an error while processing your request.", None, "invalid response: body is not JSON"]' "$rows"
+expect "grade: decide's and choose's cache entries are not used" \
+  'data["by_input"] == {"user bob login failed": 1, "user alice logged in": 1, "REFUSE this": 1, "HTTP500 boom": 3, "BADJSON": 1}' "$rows" "$stats"
+expect "grade: request body shape" \
+  'all(b["questions"] == [{"type": "score", "name": "decision", "instructions": "Is this a failed login?", "levels": [{"label": "logged in", "description": "A routine sign-in"}, {"label": "login failed", "description": "A failed sign-in, worth a look"}]}] for b in data["bodies"])' "$rows" "$stats"
+expect "grade: first run has grade_from_cache false on every event" '[r.get("grade_from_cache") for r in rows] == ["false"] * 6' "$rows"
+stub_reset
+rows="$(search "$BASE $GRADE | table n $GRADE_FIELDS")"
+stats="$(stub_stats)"
+expect "grade: repeat run returns the same scores from the cache" \
+  '[(r.get("grade"), r.get("grade_probability_login_failed"), r.get("grade_from_cache")) for r in rows] == [("0.8","0.8","true"),("0.2","0.2","true"),(None,None,"false"),(None,None,"false"),("0.8","0.8","true"),(None,None,"false")]' "$rows"
+expect "grade: repeat run calls the API only for uncached failures" \
+  'data["by_input"] == {"REFUSE this": 1, "HTTP500 boom": 3, "BADJSON": 1}' "$rows" "$stats"
+expect "grade: repeat run has no cache warnings" 'not any("cache" in m["text"] for m in messages)' "$rows"
+
+log "choose: quoted arguments arrive as written"
+stub_reset
+rows="$(search '| makeresults | eval msg="x" | choose field=msg "Is status=500 \"bad\"?" "a, b" "Has, a comma" "c=d" "Has an =" "say \"e\"" "A \"quoted\" description" f,g cache=false | table choice choice_probability_a_b choice_probability_c_d choice_probability_say_e choice_probability_f choice_error')"
+stats="$(stub_stats)"
+printf '%s\n' "$rows"
+expect "choose: quoted values and descriptions with commas, = and escaped quotes; an unquoted comma separates terms" \
+  '[(b["questions"][0]["instructions"], [(c["value"], c["description"]) for c in b["questions"][0]["choices"]]) for b in data["bodies"]] == [("Is status=500 \"bad\"?", [("a, b", "Has, a comma"), ("c=d", "Has an ="), ("say \"e\"", "A \"quoted\" description"), ("f", "g")])]' "$rows" "$stats"
+expect "choose: field names for options with punctuation" \
+  'len(rows) == 1 and rows[0].get("choice_error") is None and [rows[0].get(f) for f in ("choice_probability_a_b", "choice_probability_c_d", "choice_probability_say_e", "choice_probability_f")] == ["0.8", "0.0667", "0.0667", "0.0667"]' "$rows"
+
+log "choose and grade: argument mistakes fail the search with a clear message"
+for case in \
+  '| makeresults | choose|choose: a double-quoted question and its options are required.' \
+  '| makeresults | choose "Which team?" network Routers|choose: at least 2 options are required, but got 1.' \
+  '| makeresults | choose "Which team?" network storage identity|choose: each option must be followed by its description, but got an odd number of terms (3)' \
+  '| makeresults | choose "Which team?" network Routers storage Disks network Again|choose: duplicate option '"'"'network'"'"'.' \
+  '| makeresults | choose Which team? network Routers storage Disks|choose: put the question in double quotes.' \
+  '| makeresults | grade "How bad?" low "Fine" high|grade: each level must be followed by its description, but got an odd number of terms (3)' \
+  '| makeresults | grade "How bad?" low "Fine"|grade: at least 2 levels are required, but got 1.' \
+  '| makeresults | grade "How bad?" low "Fine" low "Bad"|grade: duplicate level '"'"'low'"'"'.'; do
+  spl="${case%%|choose:*}"; spl="${spl%%|grade:*}"; want="${case#"$spl|"}"
+  rows="$(search "$spl")"
+  WANT="$want" expect "error: $want" 'any(os.environ["WANT"] in m["text"] and m["type"] in ("ERROR", "FATAL") for m in messages) and not rows' "$rows"
+done
+
 log "logs: useful lines, and the API key never appears"
-dexec sh -c 'tail -n 8 /opt/splunk/var/log/splunk/ta_openai_decisions_decide.log'
+dexec sh -c 'tail -n 4 /opt/splunk/var/log/splunk/ta_openai_decisions_decide.log /opt/splunk/var/log/splunk/ta_openai_decisions_choose.log /opt/splunk/var/log/splunk/ta_openai_decisions_grade.log'
 if dexec sh -c "grep -rlF '$API_KEY' /opt/splunk/var/log/splunk /opt/splunk/var/run/splunk/dispatch 2>/dev/null | grep -v -e audit.log -e configuration_change.log"; then
   fail "API key found in logs"
 else

@@ -1,5 +1,9 @@
+import io
+import json
+import logging
 import operator
 import os
+import re
 import sys
 import types
 
@@ -16,6 +20,59 @@ sys.modules.setdefault("import_declare_test", types.ModuleType("import_declare_t
 from stub_decisions_api import serve_in_thread  # noqa: E402
 
 API_KEY = "sk-test-0123456789abcdef"
+
+
+def splunk_args(raw_args):
+    """The args Splunk derives from raw_args, as observed on Splunk 10.4 and
+    10.6: quotes around a whole argument or an option value are removed, and
+    the backslash of an escaped double quote or backslash is dropped."""
+    return [
+        re.sub(r'\\(["\\])', r"\1", re.sub(r'^(\w+=)?"(.*)"$', r"\1\2", arg, flags=re.S))
+        for arg in raw_args
+    ]
+
+
+def run_getinfo(monkeypatch, command_class, raw_args):
+    """Run the protocol v2 getinfo exchange the way splunkd starts the command,
+    and return the command and the error messages it wrote."""
+    import decisions_command
+
+    monkeypatch.setattr(
+        decisions_command,
+        "load_settings",
+        lambda key: {"openai": {"api_key": "k"}, "cache": {}, "proxy": {}, "logging": {}},
+    )
+    monkeypatch.setattr(
+        decisions_command, "_make_logger", lambda level, command: logging.getLogger("test")
+    )
+    command = command_class()
+    searchinfo = {
+        "args": splunk_args(raw_args),
+        "raw_args": raw_args,
+        "session_key": "s",
+        "sid": "1",
+        "app": "search",
+        "owner": "admin",
+        "username": "admin",
+        "search": "| " + command.name,
+        "splunk_version": "10.0.0",
+        "earliest_time": "0",
+        "latest_time": "0",
+        "dispatch_dir": "/tmp",
+        "splunkd_uri": "https://127.0.0.1:8089",
+    }
+    metadata = json.dumps({"action": "getinfo", "preview": False, "searchinfo": searchinfo})
+    ifile = io.BytesIO(f"chunked 1.0,{len(metadata)},0\n{metadata}".encode())
+    ofile = io.BytesIO()
+    try:
+        command.process([command.name + ".py"], ifile, ofile)
+    except SystemExit:  # the command exits after reporting an error
+        pass
+    header, _, body = ofile.getvalue().decode().partition("\n")
+    messages = (
+        json.loads(body[: int(header.split(",")[1])]).get("inspector", {}).get("messages", [])
+    )
+    return command, [text for level, text in messages if level == "ERROR"]
 
 
 @pytest.fixture

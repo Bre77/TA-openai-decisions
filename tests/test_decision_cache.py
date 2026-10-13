@@ -2,13 +2,19 @@ import io
 import logging
 import types
 
+import pytest
 from splunklib import binding
 
 from conftest import API_KEY
-from decision_cache import KVStoreCache, cache_key, describe_error
-from openai_decisions import DecisionsClient, Evaluator
+from decision_cache import KVStoreCache, cache_key, describe_error, question_cache_key
+from openai_decisions import Choice, ChoiceAnswer, DecisionsClient, Evaluator, Score, ScoreAnswer
 
 DAY = 86400.0
+
+
+def described(*values):
+    """Choice options with a description each."""
+    return [(value, f"About {value}.") for value in values]
 
 
 class Clock:
@@ -20,6 +26,7 @@ class Clock:
 
 
 def make_evaluator(stub, cache, prompt="Is this a failure?", model="gpt-6-luna"):
+    """``prompt`` is a predicate prompt or a question object."""
     client = DecisionsClient(API_KEY, base_url=stub.base_url, max_retries=0, sleep=lambda s: None)
     return Evaluator(client, prompt, model, concurrency=4, cache=cache)
 
@@ -223,4 +230,151 @@ def test_purge_failure_is_a_warning_not_an_exception(kv):
     KVStoreCache(kv, warn=warnings.append).purge()
     assert warnings == [
         "decide cache purge failed, old entries were not removed: kvstore delete unavailable"
+    ]
+
+
+# --- choice and score answers -------------------------------------------------
+
+TEAMS = Choice("Is this a failure?", described("network", "storage", "identity"))
+SEVERITY = Score("Is this a failure?", [("low", "Fine."), ("high", "Failed.")])
+
+
+def test_question_keys_cover_type_options_and_their_order():
+    key = TEAMS.cache_key("gpt-6-luna", "text")
+    assert key == question_cache_key(
+        "choice",
+        "gpt-6-luna",
+        "Is this a failure?",
+        [
+            ["network", "About network."],
+            ["storage", "About storage."],
+            ["identity", "About identity."],
+        ],
+        "text",
+    )
+    keys = {
+        key,
+        # The same model, instructions and input as a predicate or a score question.
+        cache_key("gpt-6-luna", "Is this a failure?", "text"),
+        Score("Is this a failure?", [("network", ""), ("storage", ""), ("identity", "")]).cache_key(
+            "gpt-6-luna", "text"
+        ),
+        Choice("Is this a failure?", described("storage", "network", "identity")).cache_key(
+            "gpt-6-luna", "text"
+        ),
+        Choice("Is this a failure?", described("network", "storage")).cache_key(
+            "gpt-6-luna", "text"
+        ),
+        Choice("Is this a failure?", described("network", "storage", "identity")).cache_key(
+            "other-model", "text"
+        ),
+        Choice("Another?", described("network", "storage", "identity")).cache_key(
+            "gpt-6-luna", "text"
+        ),
+        TEAMS.cache_key("gpt-6-luna", "text "),
+        # A different description, or text shifted between options, must change the key.
+        Choice(
+            "Is this a failure?",
+            [
+                ("network", "Routers."),
+                ("storage", "About storage."),
+                ("identity", "About identity."),
+            ],
+        ).cache_key("gpt-6-luna", "text"),
+        Choice("Is this a failure?", described("networks", "torage", "identity")).cache_key(
+            "gpt-6-luna", "text"
+        ),
+    }
+    assert len(keys) == 10
+
+
+def test_score_keys_cover_level_descriptions_and_order():
+    keys = {
+        Score("q", [("low", "Fine."), ("high", "Bad.")]).cache_key("m", "t"),
+        Score("q", [("low", "Fine"), ("high", "Bad.")]).cache_key("m", "t"),
+        Score("q", [("high", "Bad."), ("low", "Fine.")]).cache_key("m", "t"),
+        # Shifting text between a label and its description must change the key.
+        Score("q", [("lowF", "ine."), ("high", "Bad.")]).cache_key("m", "t"),
+    }
+    assert len(keys) == 4
+
+
+@pytest.mark.parametrize(
+    "question, text, answer, doc",
+    [
+        (
+            TEAMS,
+            "storage failed",
+            ChoiceAnswer("storage", 0.8, 0.7, (0.1, 0.8, 0.1)),
+            {"choice": "storage", "confidence": 0.7, "probabilities": "[0.1, 0.8, 0.1]"},
+        ),
+        (
+            SEVERITY,
+            "high load",
+            ScoreAnswer(0.8, 0.6, (0.2, 0.8)),
+            {"score": 0.8, "confidence": 0.6, "probabilities": "[0.2, 0.8]"},
+        ),
+    ],
+)
+def test_choice_and_score_answers_round_trip_through_the_cache(
+    stub, kv, question, text, answer, doc
+):
+    clock = Clock()
+    assert run(make_evaluator(stub, KVStoreCache(kv, clock=clock), prompt=question), [text]) == [
+        (answer, None)
+    ]
+    key = question.cache_key("gpt-6-luna", text)
+    assert kv.docs == {key: {**doc, "_key": key, "created": clock.now}}
+
+    stub.state.reset()
+    evaluator = make_evaluator(stub, KVStoreCache(kv, clock=clock), prompt=question)
+    results = list(evaluator.evaluate([text], lambda t: t))
+    assert [(a, err, from_cache) for _, a, err, from_cache in results] == [(answer, None, True)]
+    assert stub.state.requests == 0
+
+
+def test_question_types_never_share_cache_entries(stub, kv):
+    text = "storage failed"
+    run(make_evaluator(stub, KVStoreCache(kv)), [text])
+    run(make_evaluator(stub, KVStoreCache(kv), prompt=TEAMS), [text])
+    run(make_evaluator(stub, KVStoreCache(kv), prompt=SEVERITY), [text])
+    run(
+        make_evaluator(
+            stub, KVStoreCache(kv), prompt=Choice(TEAMS.instructions, described("a", "b"))
+        ),
+        [text],
+    )
+    assert stub.state.requests == 4
+    assert len(kv.docs) == 4
+
+
+@pytest.mark.parametrize(
+    "doc",
+    [
+        {"choice": "legal", "confidence": 0.7, "probabilities": "[0.1, 0.8, 0.1]"},
+        {"choice": "storage", "confidence": 0.7, "probabilities": "[0.1, 0.9]"},
+        {"choice": "storage", "confidence": 0.7, "probabilities": "[0.1, 1.8, 0.1]"},
+        {"choice": "storage", "confidence": 0.7, "probabilities": "not json"},
+        {"choice": "storage", "confidence": 0.7, "probabilities": '["a", 0.8, 0.1]'},
+        {"choice": "storage", "probabilities": "[0.1, 0.8, 0.1]"},
+        # A predicate entry stored under the same key.
+        {"probability": 0.5},
+    ],
+)
+def test_unreadable_choice_entries_are_misses(stub, kv, doc):
+    key = TEAMS.cache_key("gpt-6-luna", "storage failed")
+    kv.docs[key] = {**doc, "_key": key, "created": Clock().now}
+    cache = KVStoreCache(kv, clock=Clock())
+    assert cache.lookup([key], TEAMS) == {}
+
+
+def test_cache_warnings_name_the_command(kv):
+    kv.fail = {"batch_find", "delete"}
+    warnings = []
+    cache = KVStoreCache(kv, warn=warnings.append, command="choose")
+    cache.purge()
+    assert cache.lookup(["k"], TEAMS) == {}
+    assert [w.split(":")[0] for w in warnings] == [
+        "choose cache purge failed, old entries were not removed",
+        "choose cache lookup failed, continuing without it",
     ]

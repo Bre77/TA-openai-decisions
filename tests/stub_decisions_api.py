@@ -10,8 +10,12 @@ Behaviour is chosen by markers in the input text:
     BADJSON    -> HTTP 200 with a body that is not JSON
     SLOW       -> sleeps 3 seconds before answering
 
-Otherwise the probability is 0.95 when the input mentions "fail", "denied" or
-"invalid", else 0.05. A wrong bearer token gets HTTP 401.
+Otherwise a predicate's probability is 0.95 when the input mentions "fail",
+"denied" or "invalid", else 0.05. A choice question picks the first option
+that appears in the input (ignoring case) with probability 0.8, and the first
+option otherwise; a score question does the same with the level labels. A
+choice or score question with fewer than 2 or duplicate options, or a choice
+question with more than 255, gets HTTP 400. A wrong bearer token gets HTTP 401.
 
 GET /stats returns request counts; POST /reset clears them.
 
@@ -111,9 +115,10 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(raw.decode("utf-8"))
             text = body["input"]
             (question,) = body["questions"]
-            assert body["model"] and question["type"] == "predicate"
+            assert body["model"] and question["type"] in ("predicate", "choice", "score")
             name = question["name"]
             assert question["instructions"]
+            options = _options(question)
         except Exception as e:
             self._error(400, f"Invalid request body: {e}")
             return
@@ -131,6 +136,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, b"<html>not json</html>")
         elif "REFUSE" in text:
             self._send(200, {"answers": [{"type": "refusal", "name": name}]})
+        elif question["type"] != "predicate":
+            self._send(200, {"answers": [_ranked_answer(question, name, options, text)]})
         else:
             yes = any(word in text.lower() for word in YES_WORDS)
             self._send(
@@ -141,6 +148,47 @@ class Handler(BaseHTTPRequestHandler):
                     ]
                 },
             )
+
+
+def _options(question):
+    """The option values of a choice question or the labels of a score question."""
+    if question["type"] == "predicate":
+        return None
+    if question["type"] == "choice":
+        options = [c["value"] for c in question["choices"]]
+        assert len(options) <= 255, "at most 255 choices are allowed"
+    else:
+        options = [level["label"] for level in question["levels"]]
+    assert len(options) >= 2, "at least 2 options are required"
+    assert len(set(options)) == len(options), "options must be unique"
+    return options
+
+
+def _ranked_answer(question, name, options, text):
+    lowered = text.lower()
+    picked = next((i for i, o in enumerate(options) if o.lower() in lowered), 0)
+    rest = round(0.2 / (len(options) - 1), 4)
+    probabilities = [0.8 if i == picked else rest for i in range(len(options))]
+    if question["type"] == "choice":
+        return {
+            "type": "choice",
+            "name": name,
+            "choice": options[picked],
+            "probabilities": [
+                {"value": o, "probability": p} for o, p in zip(options, probabilities)
+            ],
+            "confidence": 0.7,
+        }
+    return {
+        "type": "score",
+        "name": name,
+        "score": round(sum(i * p for i, p in enumerate(probabilities)), 4),
+        "probabilities": [
+            {"value": i, "label": o, "probability": p}
+            for i, (o, p) in enumerate(zip(options, probabilities))
+        ],
+        "confidence": 0.6,
+    }
 
 
 class StubServer(ThreadingMixIn, HTTPServer):

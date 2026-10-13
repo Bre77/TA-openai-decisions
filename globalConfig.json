@@ -10,7 +10,7 @@
                             "type": "text",
                             "label": "API key",
                             "field": "api_key",
-                            "help": "OpenAI API key used by the decide search command. Stored encrypted in Splunk's credential store.",
+                            "help": "OpenAI API key used by the decide, choose and grade search commands. Stored encrypted in Splunk's credential store.",
                             "required": true,
                             "encrypted": true,
                             "validators": [
@@ -90,7 +90,7 @@
                             "label": "Enable result cache",
                             "field": "cache_enabled",
                             "defaultValue": true,
-                            "help": "Reuse probabilities for identical model, prompt and input from a KV store collection. The decide cache=<bool> option overrides this per search."
+                            "help": "Reuse answers for an identical model, question, options and input from a KV store collection. The cache=<bool> option of each command overrides this per search."
                         },
                         {
                             "type": "text",

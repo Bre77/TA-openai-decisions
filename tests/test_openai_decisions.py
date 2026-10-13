@@ -6,12 +6,22 @@ import requests
 
 from conftest import API_KEY
 from openai_decisions import (
+    Choice,
+    ChoiceAnswer,
     DecisionError,
     DecisionsClient,
     Evaluator,
+    Predicate,
+    Score,
+    ScoreAnswer,
     build_request,
     parse_response,
 )
+
+
+def described(*values):
+    """Choice options with a description each."""
+    return [(value, f"About {value}.") for value in values]
 
 
 def make_client(stub, **kwargs):
@@ -309,3 +319,265 @@ def test_evaluator_contains_unexpected_exceptions():
 
     evaluator = Evaluator(BrokenClient(), "q")
     assert run(evaluator, ["x"]) == [(None, "internal error: KeyError: 'boom'")]
+
+
+# --- choice and score questions -------------------------------------------
+
+TEAMS = Choice(
+    "Which team owns this?", described("network", "storage", "identity", "security operations")
+)
+SEVERITY = Score(
+    "How severe is this event?",
+    [
+        ("low", "Routine activity, no action needed."),
+        ("medium", "Worth a look during business hours."),
+        ("high risk", "Needs immediate investigation."),
+    ],
+)
+
+# Live gpt-6-luna answers to these questions about an sshd failed-password line.
+LIVE_CHOICE = {
+    "model": "gpt-6-luna",
+    "answers": [
+        {
+            "type": "choice",
+            "name": "decision",
+            "choice": "security operations",
+            "probabilities": [
+                {"value": "network", "probability": 0.0},
+                {"value": "storage", "probability": 0.01},
+                {"value": "identity", "probability": 0.3},
+                {"value": "security operations", "probability": 0.69},
+            ],
+            "confidence": 0.59,
+        }
+    ],
+    "usage": {"input_tokens": 142, "total_tokens": 142},
+}
+LIVE_SCORE = {
+    "model": "gpt-6-luna",
+    "answers": [
+        {
+            "type": "score",
+            "name": "decision",
+            "score": 0.75,
+            "probabilities": [
+                {"value": 0, "label": "low", "probability": 0.26},
+                {"value": 1, "label": "medium", "probability": 0.73},
+                {"value": 2, "label": "high risk", "probability": 0.01},
+            ],
+            "confidence": 0.6,
+        }
+    ],
+    "usage": {"input_tokens": 157, "total_tokens": 157},
+}
+
+
+def test_build_request_for_a_choice_question():
+    assert build_request(Choice("Which?", described("a", "b c")), "text", "gpt-6-luna") == {
+        "model": "gpt-6-luna",
+        "input": "text",
+        "questions": [
+            {
+                "type": "choice",
+                "name": "decision",
+                "instructions": "Which?",
+                "choices": [
+                    {"value": "a", "description": "About a."},
+                    {"value": "b c", "description": "About b c."},
+                ],
+            }
+        ],
+    }
+
+
+def test_build_request_for_a_score_question():
+    question = Score("How bad?", [("low", "Fine."), ("high", "Bad.")])
+    assert build_request(question, "text", "gpt-6-luna")["questions"] == [
+        {
+            "type": "score",
+            "name": "decision",
+            "instructions": "How bad?",
+            "levels": [
+                {"label": "low", "description": "Fine."},
+                {"label": "high", "description": "Bad."},
+            ],
+        }
+    ]
+
+
+def test_build_request_with_a_predicate_question_matches_a_prompt():
+    assert build_request(Predicate("q"), "t") == build_request("q", "t")
+
+
+def test_parse_live_choice_response():
+    assert parse_response(LIVE_CHOICE, TEAMS) == ChoiceAnswer(
+        "security operations", 0.69, 0.59, (0.0, 0.01, 0.3, 0.69)
+    )
+
+
+def test_parse_live_score_response():
+    assert parse_response(LIVE_SCORE, SEVERITY) == ScoreAnswer(0.75, 0.6, (0.26, 0.73, 0.01))
+
+
+def test_choice_probabilities_follow_the_option_order_not_the_response_order():
+    payload = {
+        "answers": [
+            {
+                "type": "choice",
+                "name": "decision",
+                "choice": "b",
+                "probabilities": [
+                    {"value": "b", "probability": 0.7},
+                    {"value": "a", "probability": 0.3},
+                ],
+                "confidence": 0.4,
+            }
+        ]
+    }
+    assert parse_response(payload, Choice("q", described("a", "b"))) == ChoiceAnswer(
+        "b", 0.7, 0.4, (0.3, 0.7)
+    )
+
+
+@pytest.mark.parametrize("question", [TEAMS, SEVERITY])
+def test_parse_choice_and_score_refusals(question):
+    with pytest.raises(DecisionError, match=r"^refusal$"):
+        parse_response({"answers": [{"type": "refusal", "name": "decision"}]}, question)
+
+
+def choice_answer(**changes):
+    answer = dict(LIVE_CHOICE["answers"][0])
+    answer.update(changes)
+    return {"answers": [{k: v for k, v in answer.items() if v is not None}]}
+
+
+def score_answer(**changes):
+    answer = dict(LIVE_SCORE["answers"][0])
+    answer.update(changes)
+    return {"answers": [{k: v for k, v in answer.items() if v is not None}]}
+
+
+def probabilities(*pairs):
+    return [{"value": v, "probability": p} for v, p in pairs]
+
+
+@pytest.mark.parametrize(
+    "payload, question, message",
+    [
+        (LIVE_SCORE, TEAMS, "unexpected answer type 'score'"),
+        (LIVE_CHOICE, SEVERITY, "unexpected answer type 'choice'"),
+        ({"answers": [{"type": "choice", "name": "x"}]}, TEAMS, "answer missing"),
+        (choice_answer(choice="legal"), TEAMS, "choice is not one of the options"),
+        (choice_answer(choice=True), TEAMS, "choice is not one of the options"),
+        (choice_answer(probabilities=None), TEAMS, "probabilities missing"),
+        (choice_answer(probabilities="0.5"), TEAMS, "probabilities missing"),
+        (
+            choice_answer(probabilities=probabilities(("network", 1.0))),
+            TEAMS,
+            "probabilities do not match the options",
+        ),
+        (
+            choice_answer(
+                probabilities=[
+                    *LIVE_CHOICE["answers"][0]["probabilities"],
+                    {"value": "legal", "probability": 0},
+                ]
+            ),
+            TEAMS,
+            "probabilities do not match the options",
+        ),
+        (
+            choice_answer(
+                probabilities=[
+                    *LIVE_CHOICE["answers"][0]["probabilities"][:3],
+                    {"value": "network", "probability": 0.69},
+                ]
+            ),
+            TEAMS,
+            "probabilities do not match the options",
+        ),
+        (
+            choice_answer(
+                probabilities=[
+                    *LIVE_CHOICE["answers"][0]["probabilities"][:3],
+                    {"value": "security operations", "probability": 1.5},
+                ]
+            ),
+            TEAMS,
+            "probability out of range",
+        ),
+        (
+            choice_answer(probabilities=[{"value": ["network"], "probability": 1.0}]),
+            TEAMS,
+            "probabilities do not match the options",
+        ),
+        (choice_answer(probabilities=[None]), TEAMS, "probabilities do not match the options"),
+        (choice_answer(confidence=None), TEAMS, "confidence missing"),
+        (choice_answer(confidence="high"), TEAMS, "confidence missing"),
+        (choice_answer(confidence=float("inf")), TEAMS, "confidence out of range"),
+        (score_answer(score=None), SEVERITY, "score missing"),
+        (score_answer(score=float("nan")), SEVERITY, "score out of range"),
+        (score_answer(confidence=None), SEVERITY, "confidence missing"),
+        (
+            # True == 1, but a boolean is not a level index.
+            score_answer(probabilities=probabilities((0, 0.2), (True, 0.7), (2, 0.1))),
+            SEVERITY,
+            "probabilities do not match the options",
+        ),
+        (
+            score_answer(probabilities=probabilities((0, 0.2), (1, 0.7), (3, 0.1))),
+            SEVERITY,
+            "probabilities do not match the options",
+        ),
+    ],
+)
+def test_parse_rejects_malformed_choice_and_score_answers(payload, question, message):
+    with pytest.raises(DecisionError, match=message):
+        parse_response(payload, question)
+
+
+@pytest.mark.parametrize(
+    "make, message",
+    [
+        (lambda: Choice("q", described("a")), "at least 2 options are required, but got 1"),
+        (lambda: Choice("q", described()), "at least 2 options are required, but got 0"),
+        (lambda: Choice("q", described(*[str(i) for i in range(256)])), "at most 255 options"),
+        (lambda: Choice("q", described("a", "b", "a")), "duplicate option 'a'"),
+        (lambda: Choice("q", described("a", "")), "options must not be empty"),
+        (lambda: Score("q", [("low", "d")]), "at least 2 levels are required, but got 1"),
+        (lambda: Score("q", [("low", "d"), ("low", "e")]), "duplicate level 'low'"),
+        (lambda: Score("q", [("low", "d"), (" ", "e")]), "levels must not be empty"),
+    ],
+)
+def test_questions_reject_option_lists_the_api_would(make, message):
+    with pytest.raises(ValueError, match=message):
+        make()
+
+
+def test_choice_and_score_over_http(stub):
+    client = make_client(stub)
+    teams = Choice("Which team?", described("network", "storage", "identity"))
+    answer = client.ask(teams, "the storage array is full")
+    assert answer.choice == "storage" and answer.probability == 0.8
+    assert answer.probabilities == (0.1, 0.8, 0.1) and answer.confidence == 0.7
+    severity = Score("How bad?", [("low", "Fine."), ("medium", "Hmm."), ("high", "Bad.")])
+    answer = client.ask(severity, "a HIGH load")
+    assert answer == ScoreAnswer(1.7, 0.6, (0.1, 0.1, 0.8))
+    assert [b["questions"][0]["type"] for b in stub.state.bodies] == ["choice", "score"]
+    with pytest.raises(DecisionError, match=r"^refusal$"):
+        client.ask(teams, "REFUSE this")
+
+
+def test_evaluator_answers_choice_questions(stub):
+    teams = Choice("Which team?", described("network", "storage"))
+    evaluator = Evaluator(make_client(stub, max_retries=0), teams, concurrency=2)
+    results = run(evaluator, ["network down", "disk full", "network down", "HTTP500", ""])
+    assert [(a and a.choice, err) for a, err in results] == [
+        ("network", None),
+        ("network", None),
+        ("network", None),
+        (None, "HTTP 500: The server had an error while processing your request."),
+        (None, "empty input"),
+    ]
+    assert stub.state.by_input == {"network down": 1, "disk full": 1, "HTTP500": 1}
