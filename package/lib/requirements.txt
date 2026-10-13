@@ -1,0 +1,9 @@
+splunktaucclib
+splunk-sdk>=2.1.1,<3
+solnlib
+requests
+# SOCKS proxy support for requests (Proxy tab socks4/socks5 types).
+PySocks
+# charset-normalizer's binary wheels carry optional mypyc .so speedups; build the
+# pure-Python distribution so the add-on stays platform-independent.
+--no-binary charset-normalizer

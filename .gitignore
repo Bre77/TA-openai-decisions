@@ -1,0 +1,7 @@
+output
+*.tar.gz
+__pycache__
+.pytest_cache
+.venv*
+.DS_Store
+dist

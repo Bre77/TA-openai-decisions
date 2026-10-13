@@ -1,0 +1,229 @@
+{
+    "pages": {
+        "configuration": {
+            "tabs": [
+                {
+                    "name": "openai",
+                    "title": "OpenAI",
+                    "entity": [
+                        {
+                            "type": "text",
+                            "label": "API key",
+                            "field": "api_key",
+                            "help": "OpenAI API key used by the decide search command. Stored encrypted in Splunk's credential store.",
+                            "required": true,
+                            "encrypted": true,
+                            "validators": [
+                                {
+                                    "type": "string",
+                                    "errorMsg": "API key should be between 1 and 1024 characters",
+                                    "minLength": 1,
+                                    "maxLength": 1024
+                                }
+                            ]
+                        },
+                        {
+                            "type": "text",
+                            "label": "Base URL",
+                            "field": "base_url",
+                            "help": "OpenAI API base URL. Change only to use a compatible gateway or a test endpoint.",
+                            "required": true,
+                            "defaultValue": "https://api.openai.com/v1",
+                            "validators": [
+                                {
+                                    "type": "regex",
+                                    "errorMsg": "Base URL must start with https:// or http:// and contain no spaces",
+                                    "pattern": "^https?://[^\\s/]+(/\\S*)?$"
+                                },
+                                {
+                                    "type": "string",
+                                    "errorMsg": "Base URL should be between 1 and 500 characters",
+                                    "minLength": 1,
+                                    "maxLength": 500
+                                }
+                            ]
+                        },
+                        {
+                            "type": "text",
+                            "label": "Request timeout",
+                            "field": "request_timeout",
+                            "help": "Seconds to wait for each API request before giving up on that event.",
+                            "required": true,
+                            "defaultValue": "30",
+                            "validators": [
+                                {
+                                    "type": "number",
+                                    "range": [
+                                        1,
+                                        300
+                                    ],
+                                    "isInteger": true
+                                }
+                            ]
+                        },
+                        {
+                            "type": "text",
+                            "label": "Maximum concurrent requests",
+                            "field": "max_concurrency",
+                            "help": "Upper bound on API requests in flight at once for each running search.",
+                            "required": true,
+                            "defaultValue": "4",
+                            "validators": [
+                                {
+                                    "type": "number",
+                                    "range": [
+                                        1,
+                                        32
+                                    ],
+                                    "isInteger": true
+                                }
+                            ]
+                        }
+                    ]
+                },
+                {
+                    "name": "cache",
+                    "title": "Cache",
+                    "entity": [
+                        {
+                            "type": "checkbox",
+                            "label": "Enable result cache",
+                            "field": "cache_enabled",
+                            "defaultValue": true,
+                            "help": "Reuse probabilities for identical model, prompt and input from a KV store collection. The decide cache=<bool> option overrides this per search."
+                        },
+                        {
+                            "type": "text",
+                            "label": "Time to live (days)",
+                            "field": "ttl_days",
+                            "required": true,
+                            "defaultValue": "7",
+                            "help": "Cached probabilities older than this are ignored and purged.",
+                            "validators": [
+                                {
+                                    "type": "number",
+                                    "range": [
+                                        1,
+                                        365
+                                    ],
+                                    "isInteger": true
+                                }
+                            ]
+                        },
+                        {
+                            "type": "text",
+                            "label": "Maximum entries",
+                            "field": "max_entries",
+                            "required": true,
+                            "defaultValue": "1000000",
+                            "help": "Oldest entries beyond this count are purged.",
+                            "validators": [
+                                {
+                                    "type": "number",
+                                    "range": [
+                                        1000,
+                                        100000000
+                                    ],
+                                    "isInteger": true
+                                }
+                            ]
+                        }
+                    ]
+                },
+                {
+                    "type": "proxyTab",
+                    "proxy_type": {
+                        "validators": [
+                            {
+                                "type": "regex",
+                                "errorMsg": "Proxy type must be http, socks4 or socks5",
+                                "pattern": "^(http|socks4|socks5)$"
+                            }
+                        ],
+                        "type": "singleSelect",
+                        "label": "Proxy Type",
+                        "required": false,
+                        "options": {
+                            "disableSearch": true,
+                            "autoCompleteFields": [
+                                {
+                                    "value": "http",
+                                    "label": "http"
+                                },
+                                {
+                                    "value": "socks4",
+                                    "label": "socks4"
+                                },
+                                {
+                                    "value": "socks5",
+                                    "label": "socks5"
+                                }
+                            ]
+                        },
+                        "defaultValue": "http",
+                        "field": "proxy_type"
+                    },
+                    "dns_resolution": true,
+                    "username": true,
+                    "password": true,
+                    "host": {
+                        "validators": [
+                            {
+                                "type": "string",
+                                "errorMsg": "Max host length is 4096",
+                                "minLength": 0,
+                                "maxLength": 4096
+                            },
+                            {
+                                "type": "regex",
+                                "errorMsg": "Proxy host must be a hostname or IP address",
+                                "pattern": "^[a-zA-Z0-9][a-zA-Z0-9.\\-]*$"
+                            }
+                        ],
+                        "type": "text",
+                        "label": "Host",
+                        "field": "proxy_url",
+                        "required": false
+                    },
+                    "port": {
+                        "type": "text",
+                        "label": "Port",
+                        "required": false,
+                        "validators": [
+                            {
+                                "type": "number",
+                                "range": [
+                                    1,
+                                    65535
+                                ],
+                                "isInteger": true
+                            }
+                        ],
+                        "field": "proxy_port"
+                    }
+                },
+                {
+                    "type": "loggingTab"
+                }
+            ],
+            "title": "Configuration",
+            "description": "Set up the OpenAI Decisions add-on"
+        }
+    },
+    "meta": {
+        "name": "TA-openai-decisions",
+        "restRoot": "ta_openai_decisions",
+        "version": "1.0.0",
+        "displayName": "OpenAI Decisions Add-on",
+        "schemaVersion": "0.0.10",
+        "defaultView": "configuration",
+        "supportedThemes": [
+            "light",
+            "dark"
+        ],
+        "supportedPythonVersion": [
+            "3.9",
+            "3.13"
+        ]
+    }
+}
