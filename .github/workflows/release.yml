@@ -1,0 +1,70 @@
+# Publish a GitHub Release when a v<version> tag is pushed. The tag must match
+# the app version; the package is built and AppInspected (precert and Splunk
+# Cloud tags) before anything is published. Uploading to Splunkbase stays a
+# manual step: this workflow needs no Splunkbase or other external credentials.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+
+jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag matches the app version
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          config=$(python3 -c 'import json; print(json.load(open("globalConfig.json"))["meta"]["version"])')
+          manifest=$(python3 -c 'import json; print(json.load(open("package/app.manifest"))["info"]["id"]["version"])')
+          echo "tag=$tag globalConfig.json=$config package/app.manifest=$manifest"
+          if [ "$tag" != "$config" ] || [ "$tag" != "$manifest" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match the app version (globalConfig.json $config, package/app.manifest $manifest)"
+            exit 1
+          fi
+
+  build:
+    needs: check-version
+    uses: ./.github/workflows/_build.yml
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.build.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: TA-openai-decisions-${{ needs.build.outputs.version }}
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          pkg="TA-openai-decisions-$VERSION.tar.gz"
+          mv "dist/$pkg" .
+          sha256sum "$pkg" > "$pkg.sha256"
+          {
+            echo "Splunk add-on package for TA-openai-decisions $VERSION, built from $GITHUB_SHA."
+            echo
+            echo "To publish, download \`$pkg\` and upload it to Splunkbase by hand."
+            echo
+            echo "SHA-256: \`$(cut -d' ' -f1 "$pkg.sha256")\`"
+            echo
+            cat appinspect/summary.md
+          } > notes.md
+          prerelease=()
+          case "$VERSION" in *-*) prerelease=(--prerelease) ;; esac
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --title "$VERSION" --notes-file notes.md "${prerelease[@]}" \
+            "$pkg" "$pkg.sha256" appinspect/appinspect-precert.json appinspect/appinspect-cloud.json
