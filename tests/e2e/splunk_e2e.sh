@@ -7,9 +7,10 @@
 # The container must be a healthy docker.io/splunk/splunk with admin password
 # "devcontainer" (e.g. SplunkUI-devcontainer's test-harness container). The
 # script installs the package, restarts Splunk, and asserts the decide
-# command's behaviour: probabilities, per-event errors that do not stop the
-# search, the where-clause filter, field/output options, the KV store cache,
-# an invalid key short-circuit, and that the API key never reaches a log.
+# command's behaviour: the positional and prompt= forms of the prompt,
+# probabilities, per-event errors that do not stop the search, the where-clause
+# filter, field/output options, the KV store cache and decision_from_cache, an
+# invalid key short-circuit, and that the API key never reaches a log.
 set -euo pipefail
 
 CONTAINER="${1:?usage: splunk_e2e.sh <container> <package.tar.gz>}"
@@ -116,9 +117,9 @@ BASE='| makeresults count=6 | streamstats count as n
 | eval _raw=case(n=1,"user bob login failed", n=2,"user alice logged in", n=3,"REFUSE this",
                  n=4,"HTTP500 boom", n=5,"user bob login failed", n=6,"BADJSON")'
 
-log "decide: probabilities and per-event errors"
+log "decide: probabilities and per-event errors (positional prompt)"
 stub_reset
-rows="$(search "$BASE | decide prompt=\"Is this a failed login?\" | table n _raw decision_probability decision_error")"
+rows="$(search "$BASE | decide \"Is this a failed login?\" | table n _raw decision_probability decision_error decision_from_cache")"
 printf '%s\n' "$rows"
 stats="$(stub_stats)"
 expect "all 6 events returned in order" '[r["n"] for r in rows] == ["1","2","3","4","5","6"]' "$rows"
@@ -129,14 +130,17 @@ expect "duplicate input decided once; HTTP 500 retried" \
 expect "request body shape" \
   'all(b["model"] == "gpt-6-luna" and b["questions"] == [{"type": "predicate", "name": "decision", "instructions": "Is this a failed login?"}] for b in data["bodies"])' "$rows" "$stats"
 expect "search warnings surfaced" 'sum("some events could not be decided" in m["text"] for m in messages) == 3' "$rows"
+expect "first run: decision_from_cache false on every event" '[r.get("decision_from_cache") for r in rows] == ["false"] * 6' "$rows"
 
 log "decide: repeat run is served from the KV store cache, and expired entries are purged"
 rest POST "/servicesNS/nobody/$APP/storage/collections/data/ta_openai_decisions_cache" \
   -H 'Content-Type: application/json' -d '{"_key": "expired-e2e", "probability": 0.5, "created": 1}' >/dev/null
 stub_reset
-rows="$(search "$BASE | decide prompt=\"Is this a failed login?\" | table n decision_probability decision_error")"
+rows="$(search "$BASE | decide prompt=\"Is this a failed login?\" | table n decision_probability decision_error decision_from_cache")"
 stats="$(stub_stats)"
 expect "same probabilities from cache" '[r.get("decision_probability") for r in rows] == ["0.95","0.05",None,None,"0.95",None]' "$rows"
+expect "repeat run: decision_from_cache true on cache hits, false on errors" \
+  '[r.get("decision_from_cache") for r in rows] == ["true","true","false","false","true","false"]' "$rows"
 expect "only uncached failures hit the API" \
   'data["by_input"] == {"REFUSE this": 1, "HTTP500 boom": 3, "BADJSON": 1}' "$rows" "$stats"
 kv="$(rest GET "/servicesNS/nobody/$APP/storage/collections/data/ta_openai_decisions_cache?output_mode=json")"
@@ -145,13 +149,14 @@ expect "KV store holds exactly the 2 successful results (expired entry purged)" 
 
 log "decide: cache=false bypasses the cache"
 stub_reset
-rows="$(search "$BASE | decide prompt=\"Is this a failed login?\" cache=false | table n decision_probability")"
+rows="$(search "$BASE | decide cache=false \"Is this a failed login?\" | table n decision_probability decision_from_cache")"
 stats="$(stub_stats)"
 expect "cache=false calls the API for every distinct input" \
   'data["by_input"].get("user bob login failed") == 1 and data["by_input"].get("user alice logged in") == 1' "$rows" "$stats"
+expect "cache=false: no decision_from_cache field" 'len(rows) == 6 and all("decision_from_cache" not in r for r in rows)' "$rows"
 
 log "decide | where filters on the probability"
-rows="$(search "$BASE | decide prompt=\"Is this a failed login?\" | where decision_probability > 0.8 | table n")"
+rows="$(search "$BASE | decide \"Is this a failed login?\" | where decision_probability > 0.8 | table n")"
 expect "where keeps only the two failed logins" '[r["n"] for r in rows] == ["1","5"]' "$rows"
 
 log "decide field= output= error_field= model="
@@ -163,14 +168,26 @@ expect "custom fields" '[(r["n"], r.get("p"), r.get("why")) for r in rows] == [(
 expect "field= input and model= sent" \
   'sorted(b["input"] for b in data["bodies"]) == ["access denied", "welcome"] and {b["model"] for b in data["bodies"]} == {"gpt-6-luna-test"}' "$rows" "$stats"
 
-log "decide: a missing prompt fails the search with a clear message"
+log "decide: a quoted positional prompt may contain = and follow the options"
+stub_reset
+rows="$(search '| makeresults | eval msg="status 500" | decide field=msg "Is status=500 an error?" | table decision_probability decision_error')"
+stats="$(stub_stats)"
+expect "positional prompt with = decided" 'len(rows) == 1 and rows[0].get("decision_error") is None and rows[0].get("decision_probability")' "$rows"
+expect "positional prompt with = sent verbatim" \
+  '[b["questions"][0]["instructions"] for b in data["bodies"]] == ["Is status=500 an error?"] and data["bodies"][0]["input"] == "status 500"' "$rows" "$stats"
+
+log "decide: prompt mistakes fail the search with a clear message"
 rows="$(search '| makeresults | decide')"
-expect "missing prompt error" 'any("prompt" in m["text"] and m["type"] == "ERROR" for m in messages)' "$rows"
+expect "missing prompt error" 'any("a prompt is required" in m["text"] and m["type"] in ("ERROR", "FATAL") for m in messages)' "$rows"
+rows="$(search '| makeresults | decide "Is this a failed login?" prompt="Is this a failed login?"')"
+expect "both forms error" 'any("not both" in m["text"] and m["type"] in ("ERROR", "FATAL") for m in messages)' "$rows"
+rows="$(search '| makeresults | decide Is this a failed login?')"
+expect "unquoted multi-word prompt error" 'any("one double-quoted string, but got 5 separate terms" in m["text"] and m["type"] in ("ERROR", "FATAL") for m in messages)' "$rows"
 
 log "decide: an invalid API key stops calling the API but keeps the events"
 settings openai -d api_key=sk-wrong-key >/dev/null
 stub_reset
-rows="$(search '| makeresults count=20 | streamstats count as n | eval _raw="event ".n | decide prompt="q?" cache=false | table n decision_probability decision_error')"
+rows="$(search '| makeresults count=20 | streamstats count as n | eval _raw="event ".n | decide "q?" cache=false | table n decision_probability decision_error')"
 stats="$(stub_stats)"
 expect "20 events with the 401 error" 'len(rows) == 20 and all(r.get("decision_error") == "HTTP 401: Incorrect API key provided." and r.get("decision_probability") is None for r in rows)' "$rows"
 expect "at most max_concurrency requests sent" 'data["requests"] <= 4' "$rows" "$stats"
@@ -178,7 +195,7 @@ settings openai -d api_key="$API_KEY" >/dev/null
 
 log "decide: a user without list_storage_passwords gets a clear error"
 rest POST /services/authentication/users -d name=e2euser -d password=devcontainer1 -d roles=user -o /dev/null || true
-rows="$(search '| makeresults | decide prompt="q?"' e2euser:devcontainer1)"
+rows="$(search '| makeresults | decide "q?"' e2euser:devcontainer1)"
 printf '%s\n' "$rows"
 expect "permission error explains the capability" 'any("list_storage_passwords" in m["text"] for m in messages)' "$rows"
 

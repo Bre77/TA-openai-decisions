@@ -19,7 +19,7 @@ def make_evaluator(stub, cache, prompt="Is this a failure?", model="gpt-6-luna")
 
 
 def run(evaluator, texts):
-    return [(p, err) for _, p, err in evaluator.evaluate(texts, lambda t: t)]
+    return [(p, err) for _, p, err, _ in evaluator.evaluate(texts, lambda t: t)]
 
 
 def test_cache_key_covers_model_prompt_and_exact_input():
@@ -64,6 +64,24 @@ def test_hit_skips_the_api(stub, kv):
     ]
     assert stub.state.requests == 0
     assert evaluator.stats == {"events": 3, "api_calls": 0, "cache_hits": 2, "cached": 0}
+
+
+def test_from_cache_is_true_only_for_cached_probabilities(stub, kv):
+    run(make_evaluator(stub, KVStoreCache(kv)), ["login failed"])
+    evaluator = make_evaluator(stub, KVStoreCache(kv))
+
+    def decide(texts):
+        return [(p, err, c) for _, p, err, c in evaluator.evaluate(texts, lambda t: t)]
+
+    assert decide(["login failed", "all good", "REFUSE this", "", "login failed"]) == [
+        (0.95, None, True),
+        (0.05, None, False),
+        (None, "refusal", False),
+        (None, "empty input", False),
+        (0.95, None, True),
+    ]
+    # Later chunks reuse the search's in-memory copy, which still came from the cache.
+    assert decide(["login failed", "all good"]) == [(0.95, None, True), (0.05, None, False)]
 
 
 def test_a_different_prompt_or_model_misses(stub, kv):

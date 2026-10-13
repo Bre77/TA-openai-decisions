@@ -271,11 +271,13 @@ class Evaluator:
         self.stats = {}
 
     def evaluate(self, items, get_text):
-        """Yield ``(item, probability, error)`` for each item, in input order.
+        """Yield ``(item, probability, error, from_cache)`` for each item, in input order.
 
         ``get_text(item)`` returns the text to decide; an empty value yields an
         error without calling the API. Exactly one of probability and error is
-        None. ``stats`` describes the chunk once the generator is exhausted.
+        None. ``from_cache`` is True when the probability was read from the
+        result cache, in this chunk or an earlier one. ``stats`` describes the
+        chunk once the generator is exhausted.
         """
         items = list(items)
         texts = [get_text(item) for item in items]
@@ -296,7 +298,7 @@ class Evaluator:
             hits = self._cache.lookup(list(keys.values()))
             for text in unknown:
                 if keys[text] in hits:
-                    chunk[text] = self._remember(text, _resolved(hits[keys[text]]))
+                    chunk[text] = self._remember(text, _from_cache(hits[keys[text]]))
                     stats["cache_hits"] += 1
 
         # Submit API calls lazily, at most `window` records ahead of the record
@@ -361,17 +363,21 @@ class Evaluator:
     @staticmethod
     def _result(item, future):
         if future is None:
-            return item, None, "empty input"
+            return item, None, "empty input", False
         try:
-            return item, future.result(), None
+            return item, future.result(), None, isinstance(future, _CachedResult)
         except DecisionError as e:
-            return item, None, str(e)
+            return item, None, str(e), False
         except Exception as e:  # never let one event kill the search
-            return item, None, _truncate(f"internal error: {type(e).__name__}: {e}")
+            return item, None, _truncate(f"internal error: {type(e).__name__}: {e}"), False
 
 
-def _resolved(value):
-    future = Future()
+class _CachedResult(Future):
+    """A probability read from the result cache rather than the API."""
+
+
+def _from_cache(value):
+    future = _CachedResult()
     future.set_result(value)
     return future
 
