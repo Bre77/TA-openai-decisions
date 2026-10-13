@@ -15,11 +15,12 @@
 #
 """decide: score each event against a yes/no prompt with the OpenAI Decisions API.
 
-    ... | decide prompt="<question>" [field=<field>] [output=<field>]
+    ... | decide "<question>" [field=<field>] [output=<field>]
                  [error_field=<field>] [model=<model>] [cache=<bool>]
 
-Adds the predicate probability to every event and never drops events;
-filtering is left to a following ``where``.
+The question can also be given as ``prompt="<question>"``. Adds the predicate
+probability to every event and never drops events; filtering is left to a
+following ``where``.
 
 This dispatch module is hand-written rather than generated from globalConfig
 ``customSearchCommand`` because the command must declare ``distributed=False``
@@ -28,6 +29,7 @@ instead of fanning API calls out from every indexer.
 """
 
 import logging
+import re
 import sys
 from urllib.parse import quote, urlsplit
 
@@ -44,6 +46,14 @@ APP_NAME = "TA-openai-decisions"
 SETTINGS_CONF = "ta_openai_decisions_settings"
 SETTINGS_REALM = f"__REST_CREDENTIAL__#{APP_NAME}#configs/conf-{SETTINGS_CONF}"
 LOG_NAMESPACE = "ta_openai_decisions"
+
+# Set to "true" or "false" on every event while the cache is enabled for the search.
+FROM_CACHE_FIELD = "decision_from_cache"
+
+# An argument of this form, unless Splunk saw it quoted, is an option.
+OPTION_ARG = re.compile(r"[A-Za-z_]\w*=")
+
+PROMPT_EXAMPLE = '| decide "Is this a failed login?"'
 
 # Distinct per-event errors surfaced as search warnings; the rest go to the log only.
 MAX_UI_WARNINGS = 5
@@ -121,17 +131,18 @@ def _int_setting(settings, name, default):
 class DecideCommand(StreamingCommand):
     """
     ##Syntax
-    decide prompt=<string> [field=<field>] [output=<field>] [error_field=<field>]
-    [model=<string>] [cache=<bool>]
+    decide (<string> | prompt=<string>) [field=<field>] [output=<field>]
+    [error_field=<field>] [model=<string>] [cache=<bool>]
 
     ##Description
     Asks the OpenAI Decisions API a yes/no question about each event and adds the
-    predicate probability (0 to 1) as a field. Events are never dropped.
+    predicate probability (0 to 1) as a field. Events are never dropped. The
+    question is the first argument, in double quotes, or the prompt option.
     """
 
     prompt = Option(
-        doc="The yes/no question each event is evaluated against.",
-        require=True,
+        doc="The yes/no question each event is evaluated against, when it is not "
+        "given as the first argument.",
     )
     field = Option(
         doc="Field whose value is sent as the input. Default: _raw.",
@@ -159,9 +170,21 @@ class DecideCommand(StreamingCommand):
         validate=validators.Boolean(),
     )
 
+    def _protocol_v2_option_parser(self, arg):
+        # splunklib splits every argument at its first "=", so a quoted prompt
+        # such as "Is status=500 an error?" would be read as an option. Splunk
+        # strips the quotes from args but keeps them in raw_args.
+        if OPTION_ARG.match(arg) and f'"{arg}"' not in self._raw_args():
+            return arg.split("=", 1)
+        return [arg]
+
+    def _raw_args(self):
+        return getattr(self.metadata.searchinfo, "raw_args", None) or ()
+
     def prepare(self):
-        if not (self.prompt or "").strip():
-            self._fail('A non-empty value for "prompt" is required')
+        self.prompt = self._resolve_prompt()
+        if not self.prompt.strip():
+            self._fail("decide: the prompt is empty. " + _prompt_hint())
         if not (self.model or "").strip():
             self._fail('A non-empty value for "model" is required')
 
@@ -193,15 +216,34 @@ class DecideCommand(StreamingCommand):
         use_cache = self.cache
         if use_cache is None:
             use_cache = is_true(cache_settings.get("cache_enabled") or "1")
-        self._start_args = (client, concurrency, use_cache, ttl_days, max_entries, bool(proxies))
+        self._use_cache = use_cache
+        self._start_args = (client, concurrency, ttl_days, max_entries, bool(proxies))
         self._evaluator = None
         self._warned = set()
+
+    def _resolve_prompt(self):
+        """Return the prompt from the first argument or the prompt option."""
+        positional = self.fieldnames or []
+        if len(positional) > 1:
+            self._fail(
+                f"decide: the prompt must be one double-quoted string, but got {len(positional)} "
+                f"separate terms. {_prompt_hint()}"
+            )
+        if positional and self.prompt is not None:
+            self._fail(
+                "decide: give the prompt either as the first argument or as prompt=, not both"
+            )
+        if positional:
+            return positional[0]
+        if self.prompt is None:
+            self._fail("decide: a prompt is required. " + _prompt_hint())
+        return self.prompt
 
     def _start(self):
         """Per-search setup, deferred to the first chunk: Splunk also runs
         prepare() in a short-lived parse-phase process that never streams."""
-        client, concurrency, use_cache, ttl_days, max_entries, proxied = self._start_args
-        cache = self._make_cache(ttl_days, max_entries) if use_cache else None
+        client, concurrency, ttl_days, max_entries, proxied = self._start_args
+        cache = self._make_cache(ttl_days, max_entries) if self._use_cache else None
         self._evaluator = Evaluator(
             client, self.prompt, self.model, concurrency=concurrency, cache=cache
         )
@@ -240,11 +282,13 @@ class DecideCommand(StreamingCommand):
         if self._evaluator is None:
             self._start()
         total = failed = 0
-        for record, probability, error in self._evaluator.evaluate(records, self._text):
+        for record, probability, error, from_cache in self._evaluator.evaluate(records, self._text):
             total += 1
-            # Set both fields on every record so the chunk header always carries them.
+            # Set the fields on every record so the chunk header always carries them.
             record[self.output] = probability
             record[self.error_field] = error
+            if self._use_cache:
+                record[FROM_CACHE_FIELD] = "true" if from_cache else "false"
             if error is not None:
                 failed += 1
                 self._report(error)
@@ -282,6 +326,10 @@ class DecideCommand(StreamingCommand):
             logger.error(message)
         self.write_error(message)
         sys.exit(1)
+
+
+def _prompt_hint():
+    return f"Put the yes/no question in double quotes, for example: {PROMPT_EXAMPLE}"
 
 
 def _make_logger(level_name):

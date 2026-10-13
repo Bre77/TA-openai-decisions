@@ -244,7 +244,7 @@ def test_error_messages_redact_secrets(monkeypatch):
 
 
 def run(evaluator, texts):
-    return [(p, err) for _, p, err in evaluator.evaluate(texts, lambda t: t)]
+    return [(p, err) for _, p, err, _ in evaluator.evaluate(texts, lambda t: t)]
 
 
 def test_evaluator_preserves_order_and_isolates_failures(stub):

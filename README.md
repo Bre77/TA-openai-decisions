@@ -6,7 +6,7 @@ Splunk search command that scores events with the [OpenAI Decisions API](https:/
 
 ```spl
 index=auth sourcetype=linux_secure
-| decide prompt="Is this a failed login?"
+| decide "Is this a failed login?"
 | where decision_probability > 0.8
 ```
 
@@ -45,12 +45,13 @@ To write to the result cache, a role also needs write access to the add-on's `ta
 ## Usage
 
 ```
-decide prompt=<string> [field=<field>] [output=<field>] [error_field=<field>] [model=<string>] [cache=<bool>]
+decide "<prompt>" [field=<field>] [output=<field>] [error_field=<field>] [model=<string>] [cache=<bool>]
+decide prompt="<prompt>" [field=<field>] [output=<field>] [error_field=<field>] [model=<string>] [cache=<bool>]
 ```
 
 | Option | Default | Description |
 | --- | --- | --- |
-| `prompt` | required | The yes/no question each event is evaluated against. |
+| `"<prompt>"` or `prompt` | required | The yes/no question each event is evaluated against. See [The prompt](#the-prompt). |
 | `field` | `_raw` | The field whose value is sent to the API. Multivalue fields are joined with newlines. |
 | `output` | `decision_probability` | The field that receives the probability of "yes", from 0 to 1. |
 | `error_field` | `decision_error` | The field that receives a short reason when an event can't be decided. |
@@ -60,15 +61,25 @@ decide prompt=<string> [field=<field>] [output=<field>] [error_field=<field>] [m
 Examples:
 
 ```spl
-index=auth | decide prompt="Is this a failed login?" | where decision_probability > 0.8
+index=auth | decide "Is this a failed login?" | where decision_probability > 0.8
 
 sourcetype=tickets
-| decide prompt="Is the customer asking for a refund?" field=body output=refund_p
+| decide "Is the customer asking for a refund?" field=body output=refund_p
 | where refund_p >= 0.5
 
-index=web | decide prompt="Does this request look like an injection attempt?" cache=false
+index=web | decide "Does this request look like an injection attempt?" cache=false
 | stats count by decision_error
 ```
+
+### The prompt
+
+Give the prompt as one double-quoted string, anywhere among the options, or as `prompt="<prompt>"`. Both forms behave the same. The search fails with a clear error if:
+
+- there is no prompt, or it's empty.
+- the prompt is given both ways, such as `decide "Is this a failed login?" prompt="Is this a failed login?"`.
+- the prompt is more than one term, such as `decide Is this a failed login?`. Splunk splits an unquoted prompt into separate terms, drops its commas, and treats square brackets as a subsearch, so `decide` doesn't join the terms back together. Put the prompt in double quotes instead. A one-word prompt, such as `decide suspicious?`, works without quotes.
+
+A quoted prompt can contain `=`, such as `decide "Is status=500 an error?"`.
 
 ### When an event can't be decided
 
@@ -95,13 +106,14 @@ Results are cached in the KV store collection `ta_openai_decisions_cache`, which
 - For each chunk of events, the command looks up all the chunk's inputs in one KV store request before it calls the API, and it writes new results back in batches of up to 1,000.
 - Entries older than the time to live are ignored. Expired entries, and the oldest entries beyond the maximum size, are purged when a search that uses the cache starts.
 - Within a single search, identical inputs are sent to the API only once, even when the cache is off.
+- While the cache is on for a search, every event also gets a `decision_from_cache` field: `true` when its probability came from the cache, and `false` otherwise (the input wasn't cached, it couldn't be decided, or the KV store was unavailable). When the cache is off, through `cache=false` or the Cache setting, the field isn't added.
 
 Exact-match cache hits are rare on raw `_raw`, because every event has its own timestamp. The cache pays off when `field=` points at a normalized field that repeats across events, such as a message template, a URL path or a user agent:
 
 ```spl
 index=web
 | eval request=method." ".uri_path
-| decide prompt="Is this an admin or debug endpoint?" field=request
+| decide "Is this an admin or debug endpoint?" field=request
 ```
 
 ## Cost and latency
