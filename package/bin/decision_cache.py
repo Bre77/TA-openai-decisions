@@ -13,10 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-"""KV store result cache for the ``decide`` search command.
+"""KV store result cache for the ``decide``, ``choose`` and ``grade`` search commands.
 
-Only successful probabilities are cached; errors and refusals never are.
-Entries expire after a TTL and the collection is capped at a maximum size.
+Only successful answers are cached; errors and refusals never are. Entries
+expire after a TTL and the collection is capped at a maximum size.
 
 This module has no Splunk imports; it drives a splunklib
 ``KVStoreCollectionData`` (or any object with the same methods).
@@ -44,8 +44,37 @@ def cache_key(model, prompt, text):
     The three values are JSON-encoded as an array so no two different
     combinations can produce the same byte string.
     """
-    material = json.dumps([model, prompt, text], ensure_ascii=False, separators=(",", ":"))
+    return _sha256([model, prompt, text])
+
+
+def question_cache_key(question_type, model, prompt, options, text):
+    """sha256 over the question type, the model, the instructions, the
+    question's options (in order), and the exact input.
+
+    The five-element array can never encode the same bytes as cache_key's
+    three-element one, so entries of different question types never collide.
+    """
+    return _sha256([question_type, model, prompt, options, text])
+
+
+def _sha256(values):
+    material = json.dumps(values, ensure_ascii=False, separators=(",", ":"))
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+class ProbabilityCodec:
+    """Stores a predicate probability in a cache document."""
+
+    @staticmethod
+    def encode(probability):
+        return {"probability": probability}
+
+    @staticmethod
+    def decode(doc):
+        return _probability(doc.get("probability"))
+
+
+PROBABILITY = ProbabilityCodec()
 
 
 class KVStoreCache:
@@ -55,7 +84,11 @@ class KVStoreCache:
     shows it as a search warning), and degrades to calling the API: a failed
     lookup disables lookups for the rest of the search, a failed write
     disables writes (for example when the user's role can read but not write
-    the collection).
+    the collection). ``command`` names the search command in those messages.
+
+    A ``codec`` turns an answer into document fields (``encode``) and back
+    (``decode``, None for a document it does not recognize); the default
+    stores a predicate probability.
     """
 
     def __init__(
@@ -66,6 +99,7 @@ class KVStoreCache:
         logger=None,
         clock=time.time,
         warn=None,
+        command="decide",
     ):
         self._data = data
         self._ttl = float(ttl_days) * 86400
@@ -73,11 +107,12 @@ class KVStoreCache:
         self._log = logger or logging.getLogger(__name__)
         self._clock = clock
         self._warn = warn
+        self._command = command
         self._can_read = True
         self._can_write = True
 
-    def lookup(self, keys):
-        """Return ``{key: probability}`` for the unexpired entries among ``keys``."""
+    def lookup(self, keys, codec=PROBABILITY):
+        """Return ``{key: answer}`` for the unexpired entries among ``keys``."""
         keys = sorted(set(keys))
         if not keys or not self._can_read:
             return {}
@@ -100,24 +135,24 @@ class KVStoreCache:
             results = self._data.batch_find(*queries)
         except Exception as e:
             self._can_read = False
-            self._failed("decide cache lookup failed, continuing without it", e)
+            self._failed("cache lookup failed, continuing without it", e)
             return {}
         hits = {}
         for group in results:
             for doc in group:
-                probability = _probability(doc.get("probability"))
-                if probability is not None:
-                    hits[doc.get("_key")] = probability
+                answer = codec.decode(doc)
+                if answer is not None:
+                    hits[doc.get("_key")] = answer
         return hits
 
-    def store(self, results):
-        """Save ``{key: probability}`` in batches. Returns the number written."""
+    def store(self, results, codec=PROBABILITY):
+        """Save ``{key: answer}`` in batches. Returns the number written."""
         if not results or not self._can_write:
             return 0
         now = self._clock()
         docs = [
-            {"_key": key, "probability": probability, "created": now}
-            for key, probability in sorted(results.items())
+            {**codec.encode(answer), "_key": key, "created": now}
+            for key, answer in sorted(results.items())
         ]
         written = 0
         for i in range(0, len(docs), SAVE_BATCH_SIZE):
@@ -126,7 +161,7 @@ class KVStoreCache:
                 self._data.batch_save(*batch)
             except Exception as e:
                 self._can_write = False
-                self._failed("decide cache write failed, not caching further results", e)
+                self._failed("cache write failed, not caching further results", e)
                 break
             written += len(batch)
         return written
@@ -143,10 +178,10 @@ class KVStoreCache:
                 created = newest_excess[0].get("created")
                 self._data.delete(query=json.dumps({"created": {"$lte": created}}))
         except Exception as e:
-            self._failed("decide cache purge failed, old entries were not removed", e)
+            self._failed("cache purge failed, old entries were not removed", e)
 
     def _failed(self, what, error):
-        message = f"{what}: {describe_error(error)}"
+        message = f"{self._command} {what}: {describe_error(error)}"
         self._log.warning(message)
         if self._warn is not None:
             self._warn(message)

@@ -13,22 +13,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-"""OpenAI Decisions API client and the ordered, bounded-concurrency evaluator
-behind the ``decide`` search command.
+"""OpenAI Decisions API client, the question types it asks, and the ordered,
+bounded-concurrency evaluator behind the ``decide``, ``choose`` and ``grade``
+search commands.
 
 This module has no Splunk imports so it can be unit tested on its own.
 """
 
+import json
 import math
 import re
 import threading
 import time
-from collections import OrderedDict
+from collections import OrderedDict, namedtuple
 from concurrent.futures import Future, ThreadPoolExecutor
 
 import requests
 
-from decision_cache import cache_key
+from decision_cache import PROBABILITY, cache_key, question_cache_key
 
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_MODEL = "gpt-6-luna"
@@ -36,8 +38,14 @@ DEFAULT_TIMEOUT = 30
 DEFAULT_MAX_RETRIES = 2
 DEFAULT_CACHE_SIZE = 10000
 
-# Name of the single predicate question sent with every request.
+# Name of the single question sent with every request.
 QUESTION_NAME = "decision"
+
+# The API's limits on a choice question's options.
+MIN_CHOICES = 2
+MAX_CHOICES = 255
+# A score with fewer levels has nothing to rate; the API documents no maximum.
+MIN_LEVELS = 2
 
 MAX_ERROR_LENGTH = 200
 MAX_RETRY_DELAY = 30.0
@@ -46,6 +54,14 @@ MAX_RETRY_DELAY = 30.0
 RETRYABLE_STATUSES = frozenset([408, 409, 429, 500, 502, 503, 504])
 # Every later request would fail the same way, so stop calling the API.
 FATAL_STATUSES = frozenset([401, 403, 404])
+
+ChoiceAnswer = namedtuple("ChoiceAnswer", "choice probability confidence probabilities")
+ChoiceAnswer.__doc__ = """A choice answer: the selected option, its probability, the
+answer's confidence, and the probability of every option, in option order."""
+
+ScoreAnswer = namedtuple("ScoreAnswer", "score confidence probabilities")
+ScoreAnswer.__doc__ = """A score answer: the probability-weighted average of the level
+indices, the answer's confidence, and the probability of every level, in level order."""
 
 
 class DecisionError(Exception):
@@ -61,26 +77,187 @@ class DecisionError(Exception):
         self.retry_after = retry_after
 
 
-def build_request(prompt, text, model=DEFAULT_MODEL):
-    """Return the JSON body for a single predicate question about ``text``."""
+class Predicate:
+    """A yes/no question. The answer is the probability that it is true."""
+
+    type = "predicate"
+
+    def __init__(self, instructions):
+        self.instructions = instructions
+
+    def to_request(self):
+        return {"type": self.type, "name": QUESTION_NAME, "instructions": self.instructions}
+
+    def parse(self, answer):
+        return _probability(answer.get("probability"), "probability")
+
+    def cache_key(self, model, text):
+        return cache_key(model, self.instructions, text)
+
+    encode = staticmethod(PROBABILITY.encode)
+    decode = staticmethod(PROBABILITY.decode)
+
+    def ask(self, client, text, model):
+        return client.decide(self.instructions, text, model)
+
+
+class Choice:
+    """Select one of the ``choices``, ``(value, description)`` pairs with
+    distinct string values. The answer is a ChoiceAnswer.
+
+    Raises ValueError for a choice list the API would reject.
+    """
+
+    type = "choice"
+
+    def __init__(self, instructions, choices):
+        self.instructions = instructions
+        self.choices = tuple((value, description) for value, description in choices)
+        _check_labels(self.options, "option", MIN_CHOICES, MAX_CHOICES)
+
+    @property
+    def options(self):
+        return tuple(value for value, _ in self.choices)
+
+    def to_request(self):
+        return {
+            "type": self.type,
+            "name": QUESTION_NAME,
+            "instructions": self.instructions,
+            "choices": [
+                {"value": value, "description": description} for value, description in self.choices
+            ],
+        }
+
+    def parse(self, answer):
+        probabilities = _distribution(answer.get("probabilities"), self.options)
+        choice = answer.get("choice")
+        if not isinstance(choice, str) or choice not in self.options:
+            raise DecisionError("invalid response: choice is not one of the options")
+        confidence = _number(answer.get("confidence"), "confidence")
+        index = self.options.index(choice)
+        return ChoiceAnswer(choice, probabilities[index], confidence, probabilities)
+
+    def cache_key(self, model, text):
+        choices = [list(choice) for choice in self.choices]
+        return question_cache_key(self.type, model, self.instructions, choices, text)
+
+    @staticmethod
+    def encode(answer):
+        return {
+            "choice": answer.choice,
+            "confidence": answer.confidence,
+            "probabilities": json.dumps(list(answer.probabilities)),
+        }
+
+    def decode(self, doc):
+        probabilities = _cached_probabilities(doc, len(self.options))
+        choice, confidence = doc.get("choice"), _cached_number(doc.get("confidence"))
+        if probabilities is None or confidence is None or choice not in self.options:
+            return None
+        index = self.options.index(choice)
+        return ChoiceAnswer(choice, probabilities[index], confidence, probabilities)
+
+    def ask(self, client, text, model):
+        return client.ask(self, text, model)
+
+
+class Score:
+    """Rate the input against ordered ``levels``, ``(label, description)`` pairs
+    from lowest to highest. The answer is a ScoreAnswer.
+
+    Raises ValueError for a level list the API would reject.
+    """
+
+    type = "score"
+
+    def __init__(self, instructions, levels):
+        self.instructions = instructions
+        self.levels = tuple((label, description) for label, description in levels)
+        _check_labels([label for label, _ in self.levels], "level", MIN_LEVELS)
+
+    @property
+    def labels(self):
+        return tuple(label for label, _ in self.levels)
+
+    def to_request(self):
+        return {
+            "type": self.type,
+            "name": QUESTION_NAME,
+            "instructions": self.instructions,
+            "levels": [
+                {"label": label, "description": description} for label, description in self.levels
+            ],
+        }
+
+    def parse(self, answer):
+        indices = tuple(range(len(self.levels)))
+        probabilities = _distribution(answer.get("probabilities"), indices)
+        score = _number(answer.get("score"), "score")
+        confidence = _number(answer.get("confidence"), "confidence")
+        return ScoreAnswer(score, confidence, probabilities)
+
+    def cache_key(self, model, text):
+        levels = [list(level) for level in self.levels]
+        return question_cache_key(self.type, model, self.instructions, levels, text)
+
+    @staticmethod
+    def encode(answer):
+        return {
+            "score": answer.score,
+            "confidence": answer.confidence,
+            "probabilities": json.dumps(list(answer.probabilities)),
+        }
+
+    def decode(self, doc):
+        probabilities = _cached_probabilities(doc, len(self.levels))
+        score, confidence = _cached_number(doc.get("score")), _cached_number(doc.get("confidence"))
+        if probabilities is None or score is None or confidence is None:
+            return None
+        return ScoreAnswer(score, confidence, probabilities)
+
+    def ask(self, client, text, model):
+        return client.ask(self, text, model)
+
+
+def as_question(question):
+    """A question object, or a Predicate for a plain prompt string."""
+    return Predicate(question) if isinstance(question, str) else question
+
+
+def _check_labels(labels, kind, minimum, maximum=None):
+    if len(labels) < minimum:
+        raise ValueError(f"at least {minimum} {kind}s are required, but got {len(labels)}")
+    if maximum is not None and len(labels) > maximum:
+        raise ValueError(f"at most {maximum} {kind}s are allowed, but got {len(labels)}")
+    seen = set()
+    for label in labels:
+        if not label.strip():
+            raise ValueError(f"{kind}s must not be empty")
+        if label in seen:
+            raise ValueError(f"duplicate {kind} {label!r}")
+        seen.add(label)
+
+
+def build_request(question, text, model=DEFAULT_MODEL):
+    """Return the JSON body for a single question about ``text``.
+
+    ``question`` is a question object, or a prompt string for a predicate.
+    """
     return {
         "model": model,
         "input": text,
-        "questions": [
-            {
-                "type": "predicate",
-                "name": QUESTION_NAME,
-                "instructions": prompt,
-            }
-        ],
+        "questions": [as_question(question).to_request()],
     }
 
 
-def parse_response(payload):
-    """Return the predicate probability from a Decisions API response body.
+def parse_response(payload, question=None):
+    """Return the answer to ``question`` (default: a predicate) from a
+    Decisions API response body.
 
     Raises DecisionError for a refusal or a malformed response.
     """
+    question = question or _PREDICATE
     answers = payload.get("answers") if isinstance(payload, dict) else None
     if not isinstance(answers, list):
         raise DecisionError("invalid response: no answers")
@@ -93,15 +270,64 @@ def parse_response(payload):
     answer_type = answer.get("type")
     if answer_type == "refusal":
         raise DecisionError("refusal")
-    if answer_type != "predicate":
+    if answer_type != question.type:
         raise DecisionError(f"invalid response: unexpected answer type {answer_type!r}")
-    probability = answer.get("probability")
-    if isinstance(probability, bool) or not isinstance(probability, (int, float)):
-        raise DecisionError("invalid response: probability missing")
-    probability = float(probability)
-    if math.isnan(probability) or not 0.0 <= probability <= 1.0:
-        raise DecisionError("invalid response: probability out of range")
-    return probability
+    return question.parse(answer)
+
+
+_PREDICATE = Predicate(None)
+
+
+def _number(value, what):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise DecisionError(f"invalid response: {what} missing")
+    value = float(value)
+    if not math.isfinite(value):
+        raise DecisionError(f"invalid response: {what} out of range")
+    return value
+
+
+def _probability(value, what):
+    value = _number(value, what)
+    if not 0.0 <= value <= 1.0:
+        raise DecisionError(f"invalid response: {what} out of range")
+    return value
+
+
+def _distribution(items, values):
+    """The probabilities in ``items`` (``[{"value": v, "probability": p}]``),
+    in the order of ``values``, which they must cover exactly once each."""
+    if not isinstance(items, list):
+        raise DecisionError("invalid response: probabilities missing")
+    found = {}
+    for item in items:
+        value = item.get("value") if isinstance(item, dict) else None
+        # bool is an int subclass, and True == 1, so match the value's type too.
+        if not any(type(value) is type(v) and value == v for v in values) or value in found:
+            raise DecisionError("invalid response: probabilities do not match the options")
+        found[value] = _probability(item.get("probability"), "probability")
+    if len(found) != len(values):
+        raise DecisionError("invalid response: probabilities do not match the options")
+    return tuple(found[value] for value in values)
+
+
+def _cached_number(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value) if math.isfinite(value) else None
+
+
+def _cached_probabilities(doc, count):
+    try:
+        values = json.loads(doc.get("probabilities"))
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(values, list) or len(values) != count:
+        return None
+    values = [_cached_number(v) for v in values]
+    if any(v is None or not 0.0 <= v <= 1.0 for v in values):
+        return None
+    return tuple(values)
 
 
 def _truncate(message):
@@ -181,11 +407,18 @@ class DecisionsClient:
 
         Retries rate-limited and transient failures, then raises DecisionError.
         """
-        body = build_request(prompt, text, model)
+        return self.ask(Predicate(prompt), text, model)
+
+    def ask(self, question, text, model=DEFAULT_MODEL):
+        """Return the answer to ``question`` (a question object) about ``text``.
+
+        Retries rate-limited and transient failures, then raises DecisionError.
+        """
+        body = build_request(question, text, model)
         attempt = 0
         while True:
             try:
-                return self._post(body)
+                return self._post(body, question)
             except DecisionError as e:
                 if not e.retryable or attempt >= self.max_retries:
                     raise
@@ -211,7 +444,7 @@ class DecisionsClient:
             self._local.session = session
         return session
 
-    def _post(self, body):
+    def _post(self, body, question):
         try:
             response = self._session().post(self.url, json=body, timeout=self.timeout)
         except requests.Timeout:
@@ -230,7 +463,7 @@ class DecisionsClient:
             payload = response.json()
         except ValueError:
             raise DecisionError("invalid response: body is not JSON") from None
-        return parse_response(payload)
+        return parse_response(payload, question)
 
     def _redact(self, message):
         for secret in self._secrets:
@@ -241,24 +474,26 @@ class DecisionsClient:
 class Evaluator:
     """Decides chunks of inputs with bounded concurrency, preserving order.
 
-    Identical inputs within a search share one API call (bounded in-memory
-    cache). With a result ``cache`` (see decision_cache.KVStoreCache), each
-    chunk's remaining inputs are looked up in one batched read before any API
-    call, and the chunk's new probabilities are written back in batches.
+    ``question`` is a question object (Predicate, Choice or Score), or a
+    prompt string for a predicate. Identical inputs within a search share one
+    API call (bounded in-memory cache). With a result ``cache`` (see
+    decision_cache.KVStoreCache), each chunk's remaining inputs are looked up
+    in one batched read before any API call, and the chunk's new answers are
+    written back in batches.
     After a fatal error such as an invalid API key no further requests are sent.
     """
 
     def __init__(
         self,
         client,
-        prompt,
+        question,
         model=DEFAULT_MODEL,
         concurrency=4,
         cache=None,
         memory_size=DEFAULT_CACHE_SIZE,
     ):
         self._client = client
-        self._prompt = prompt
+        self._question = as_question(question)
         self._model = model
         self._pool = ThreadPoolExecutor(max_workers=concurrency)
         self._window = concurrency * 4
@@ -267,16 +502,16 @@ class Evaluator:
         self._memory_size = memory_size
         self._fatal = None
         self._lock = threading.Lock()
-        self._calls = 0  # client.decide invocations, for stats
+        self._calls = 0  # API requests attempted (before retries), for stats
         self.stats = {}
 
     def evaluate(self, items, get_text):
-        """Yield ``(item, probability, error, from_cache)`` for each item, in input order.
+        """Yield ``(item, answer, error, from_cache)`` for each item, in input order.
 
         ``get_text(item)`` returns the text to decide; an empty value yields an
-        error without calling the API. Exactly one of probability and error is
-        None. ``from_cache`` is True when the probability was read from the
-        result cache, in this chunk or an earlier one. ``stats`` describes the
+        error without calling the API. Exactly one of answer and error is
+        None. ``from_cache`` is True when the answer was read from the result
+        cache, in this chunk or an earlier one. ``stats`` describes the
         chunk once the generator is exhausted.
         """
         items = list(items)
@@ -294,8 +529,8 @@ class Evaluator:
 
         keys = {}
         if self._cache is not None and unknown:
-            keys = {text: cache_key(self._model, self._prompt, text) for text in unknown}
-            hits = self._cache.lookup(list(keys.values()))
+            keys = {text: self._question.cache_key(self._model, text) for text in unknown}
+            hits = self._cache.lookup(list(keys.values()), self._question)
             for text in unknown:
                 if keys[text] in hits:
                     chunk[text] = self._remember(text, _from_cache(hits[keys[text]]))
@@ -327,7 +562,7 @@ class Evaluator:
             for text, future in submitted.items():
                 if future.exception() is None:
                     fresh[keys[text]] = future.result()
-            stats["cached"] = self._cache.store(fresh)
+            stats["cached"] = self._cache.store(fresh, self._question)
         self.stats = stats
 
     def close(self):
@@ -354,7 +589,7 @@ class Evaluator:
         with self._lock:
             self._calls += 1
         try:
-            return self._client.decide(self._prompt, text, self._model)
+            return self._question.ask(self._client, text, self._model)
         except DecisionError as e:
             if e.fatal and self._fatal is None:
                 self._fatal = e
@@ -373,7 +608,7 @@ class Evaluator:
 
 
 class _CachedResult(Future):
-    """A probability read from the result cache rather than the API."""
+    """An answer read from the result cache rather than the API."""
 
 
 def _from_cache(value):
