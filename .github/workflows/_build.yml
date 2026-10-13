@@ -52,7 +52,7 @@ jobs:
           splunk-appinspect inspect "$pkg" --mode precert \
             --included-tags cloud --included-tags aarch64_compatibility \
             --data-format json --output-file appinspect/appinspect-cloud.json || true
-          python .github/scripts/appinspect_gate.py \
+          python .github/scripts/appinspect_gate.py --title "AppInspect (released package)" \
             appinspect/appinspect-precert.json appinspect/appinspect-cloud.json \
             > appinspect/summary.md || status=$?
           cat appinspect/summary.md >> "$GITHUB_STEP_SUMMARY"

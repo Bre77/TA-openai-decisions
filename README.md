@@ -155,7 +155,7 @@ tests/e2e/splunk_e2e.sh <container> dist/TA-openai-decisions-1.0.0.tar.gz
 
 ## Releasing
 
-Pushing a `v<version>` tag runs `.github/workflows/release.yml`. It checks that the tag matches the version in `globalConfig.json` and `package/app.manifest`, builds the package, runs AppInspect (precert, and the Splunk Cloud `cloud` and `aarch64_compatibility` tags), and only if no check has an error or failure, publishes a GitHub Release with the package, its `.sha256` checksum and the AppInspect reports. A version with a hyphen, such as `1.1.0-rc.1`, is published as a pre-release. The workflow never uploads to Splunkbase.
+Pushing a `v<version>` tag runs `.github/workflows/release.yml`. It checks that the tag matches the version in `globalConfig.json` and `package/app.manifest`, builds the package and runs AppInspect on it (precert, and the Splunk Cloud `cloud` and `aarch64_compatibility` tags), and runs the fleet's reusable build and AppInspect. Only if no check has an error or failure does it publish a GitHub Release with the package, its `.sha256` checksum and the AppInspect reports (the fleet's are prefixed `fleet-`). Warnings don't block a release. A version with a hyphen, such as `1.1.0-rc.1`, is published as a pre-release. The workflow never uploads to Splunkbase.
 
 1. Bump `meta.version` in `globalConfig.json` and `info.id.version` in `package/app.manifest`, and merge that to `main`.
 2. Tag the merge commit and push the tag:
