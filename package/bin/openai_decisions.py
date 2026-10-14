@@ -37,6 +37,7 @@ DEFAULT_MODEL = "gpt-6-luna"
 DEFAULT_TIMEOUT = 30
 DEFAULT_MAX_RETRIES = 2
 DEFAULT_CACHE_SIZE = 10000
+DEFAULT_LIMIT = 1000
 
 # Name of the single question sent with every request.
 QUESTION_NAME = "decision"
@@ -480,6 +481,10 @@ class Evaluator:
     decision_cache.KVStoreCache), each chunk's remaining inputs are looked up
     in one batched read before any API call, and the chunk's new answers are
     written back in batches.
+    At most ``limit`` API requests are sent over all chunks (0 or None: no
+    limit), not counting retries of a request; inputs answered from the cache
+    or from memory do not count. Once the limit is reached, inputs that need
+    a request get the ``limit_error`` instead.
     After a fatal error such as an invalid API key no further requests are sent.
     """
 
@@ -491,6 +496,7 @@ class Evaluator:
         concurrency=4,
         cache=None,
         memory_size=DEFAULT_CACHE_SIZE,
+        limit=None,
     ):
         self._client = client
         self._question = as_question(question)
@@ -503,6 +509,9 @@ class Evaluator:
         self._fatal = None
         self._lock = threading.Lock()
         self._calls = 0  # API requests attempted (before retries), for stats
+        self._limit = limit or None
+        self._submitted = 0  # API requests submitted, counted against the limit
+        self.limit_error = limit_error(limit) if self._limit else None
         self.stats = {}
 
     def evaluate(self, items, get_text):
@@ -516,7 +525,7 @@ class Evaluator:
         """
         items = list(items)
         texts = [get_text(item) for item in items]
-        stats = {"events": len(items), "api_calls": 0, "cache_hits": 0, "cached": 0}
+        stats = {"events": len(items), "api_calls": 0, "cache_hits": 0, "cached": 0, "limited": 0}
         calls_before = self._calls
 
         chunk = {}  # text -> future, for every distinct non-empty text in the chunk
@@ -549,10 +558,18 @@ class Evaluator:
         for index, (item, text) in enumerate(zip(items, texts)):
             while position < len(pending) and first_seen[pending[position]] < index + self._window:
                 text_to_submit = pending[position]
-                future = self._pool.submit(self._decide, text_to_submit)
-                chunk[text_to_submit] = submitted[text_to_submit] = self._remember(
-                    text_to_submit, future
-                )
+                if self._limit is not None and self._submitted >= self._limit and not self._fatal:
+                    # Not remembered, so a later chunk looks it up in the cache again.
+                    # After a fatal error the input is submitted anyway: _decide fails
+                    # it with that error without sending a request.
+                    chunk[text_to_submit] = _failed(DecisionError(self.limit_error))
+                    stats["limited"] += 1
+                else:
+                    self._submitted += 1
+                    future = self._pool.submit(self._decide, text_to_submit)
+                    chunk[text_to_submit] = submitted[text_to_submit] = self._remember(
+                        text_to_submit, future
+                    )
                 position += 1
             yield self._result(item, chunk[text] if text else None)
         stats["api_calls"] = self._calls - calls_before
@@ -615,6 +632,17 @@ def _from_cache(value):
     future = _CachedResult()
     future.set_result(value)
     return future
+
+
+def _failed(error):
+    future = Future()
+    future.set_exception(error)
+    return future
+
+
+def limit_error(limit):
+    """The error given to an input that needs an API request once ``limit`` is reached."""
+    return f"limit of {limit} API call{'' if limit == 1 else 's'} reached"
 
 
 def _transient_failure(future):

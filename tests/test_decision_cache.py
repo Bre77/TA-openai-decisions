@@ -25,10 +25,10 @@ class Clock:
         return self.now
 
 
-def make_evaluator(stub, cache, prompt="Is this a failure?", model="gpt-6-luna"):
+def make_evaluator(stub, cache, prompt="Is this a failure?", model="gpt-6-luna", limit=None):
     """``prompt`` is a predicate prompt or a question object."""
     client = DecisionsClient(API_KEY, base_url=stub.base_url, max_retries=0, sleep=lambda s: None)
-    return Evaluator(client, prompt, model, concurrency=4, cache=cache)
+    return Evaluator(client, prompt, model, concurrency=4, cache=cache, limit=limit)
 
 
 def run(evaluator, texts):
@@ -59,7 +59,13 @@ def test_miss_calls_the_api_and_stores_the_result(stub, kv):
     evaluator = make_evaluator(stub, KVStoreCache(kv, clock=clock))
     assert run(evaluator, ["login failed", "all good"]) == [(0.95, None), (0.05, None)]
     assert stub.state.requests == 2
-    assert evaluator.stats == {"events": 2, "api_calls": 2, "cache_hits": 0, "cached": 2}
+    assert evaluator.stats == {
+        "events": 2,
+        "api_calls": 2,
+        "cache_hits": 0,
+        "cached": 2,
+        "limited": 0,
+    }
     key = cache_key("gpt-6-luna", "Is this a failure?", "login failed")
     assert kv.docs[key] == {"_key": key, "probability": 0.95, "created": clock.now}
 
@@ -76,7 +82,38 @@ def test_hit_skips_the_api(stub, kv):
         (0.95, None),
     ]
     assert stub.state.requests == 0
-    assert evaluator.stats == {"events": 3, "api_calls": 0, "cache_hits": 2, "cached": 0}
+    assert evaluator.stats == {
+        "events": 3,
+        "api_calls": 0,
+        "cache_hits": 2,
+        "cached": 0,
+        "limited": 0,
+    }
+
+
+def test_cache_hits_do_not_count_against_the_limit(stub, kv):
+    run(make_evaluator(stub, KVStoreCache(kv)), ["cached fail", "cached ok"])
+    stub.state.reset()
+
+    evaluator = make_evaluator(stub, KVStoreCache(kv), limit=1)
+    texts = ["cached fail", "new 1", "cached ok", "new 2", "cached fail", "new 1"]
+    assert run(evaluator, texts) == [
+        (0.95, None),
+        (0.05, None),
+        (0.05, None),
+        (None, "limit of 1 API call reached"),
+        (0.95, None),
+        (0.05, None),
+    ]
+    assert stub.state.by_input == {"new 1": 1}
+    # Cache hits after the limit are still answered, in later chunks too.
+    assert run(evaluator, ["new 2", "cached ok"]) == [
+        (None, "limit of 1 API call reached"),
+        (0.05, None),
+    ]
+    assert stub.state.requests == 1
+    # Only the answer from the API is new to the cache.
+    assert len(kv.docs) == 3
 
 
 def test_from_cache_is_true_only_for_cached_probabilities(stub, kv):

@@ -4,9 +4,11 @@ import types
 
 import pytest
 
+import choose
 import conftest
 import decide
 import decisions_command
+import grade
 from openai_decisions import Evaluator, Predicate
 
 
@@ -76,6 +78,7 @@ def make_command(**options):
     command._use_cache = False
     command._log = logging.getLogger("test")
     command._warned = set()
+    command._limit_reached = False
     command.warnings = []
     command.write_warning = lambda message, *args: command.warnings.append(message.format(*args))
     return command
@@ -140,6 +143,61 @@ def test_command_defaults():
     assert command.error_field == "decision_error"
     assert command.model == "gpt-6-luna"
     assert command.cache is None
+    assert command.limit == 1000
+
+
+QUESTION_ARGS = {
+    decide.DecideCommand: ['"q?"'],
+    choose.ChooseCommand: ['"Which?"', "a", "A", "b", "B"],
+    grade.GradeCommand: ['"How bad?"', "low", "Fine", "high", "Bad"],
+}
+
+
+@pytest.mark.parametrize("command_class", list(QUESTION_ARGS))
+@pytest.mark.parametrize("args, limit", [([], 1000), (["limit=5"], 5), (["limit=0"], 0)])
+def test_limit_option(monkeypatch, command_class, args, limit):
+    command, errors = conftest.run_getinfo(
+        monkeypatch, command_class, QUESTION_ARGS[command_class] + args
+    )
+    assert errors == []
+    assert command.limit == limit
+
+
+@pytest.mark.parametrize("command_class", list(QUESTION_ARGS))
+@pytest.mark.parametrize(
+    "arg, error",
+    [
+        ("limit=-1", "{}: limit must be a number of API calls, or 0 for no limit, but got -1"),
+        ("limit=lots", "Illegal value: limit=lots"),
+    ],
+)
+def test_limit_errors(monkeypatch, command_class, arg, error):
+    command, errors = conftest.run_getinfo(
+        monkeypatch, command_class, [*QUESTION_ARGS[command_class], arg]
+    )
+    assert len(errors) == 1 and error.format(command.name) in errors[0]
+
+
+def test_stream_keeps_events_past_the_limit_with_one_warning():
+    command = make_command(limit=2)
+    command._evaluator = Evaluator(FakeClient(), "q", limit=2)
+    first = list(command.stream([{"_raw": "a fail"}, {"_raw": "b"}, {"_raw": "a fail"}]))
+    second = list(command.stream([{"_raw": "c"}, {"_raw": "b"}, {"_raw": ""}, {"_raw": "d"}]))
+    assert [(r["decision_probability"], r["decision_error"]) for r in first + second] == [
+        (0.9, None),
+        (0.1, None),
+        (0.9, None),
+        (None, "limit of 2 API calls reached"),
+        (0.1, None),
+        (None, "empty input"),
+        (None, "limit of 2 API calls reached"),
+    ]
+    assert command._evaluator._client.inputs == ["a fail", "b"]
+    assert command.warnings == [
+        "decide: limit of 2 API calls reached, so events that needed another call were not "
+        "decided. Raise the limit with limit=<number>, or use limit=0 for no limit.",
+        "decide: some events could not be decided: empty input",
+    ]
 
 
 def test_stream_adds_both_fields_to_every_event_and_drops_no_events():
