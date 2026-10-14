@@ -65,12 +65,13 @@ All three commands take the same keyword options:
 | `error_field` | see each command | The field that receives a short reason when an event can't be decided. |
 | `model` | `gpt-6-luna` | The Decisions model. |
 | `cache` | Cache setting | `true` or `false` overrides the add-on's cache setting for this search. |
+| `limit` | `1000` | The most API requests the search sends. Cache hits don't count. `0` means no limit. See [Limiting API calls](#limiting-api-calls). |
 
 ### decide
 
 ```
-decide "<prompt>" [field=<field>] [output=<field>] [error_field=<field>] [model=<string>] [cache=<bool>]
-decide prompt="<prompt>" [field=<field>] [output=<field>] [error_field=<field>] [model=<string>] [cache=<bool>]
+decide "<prompt>" [field=<field>] [output=<field>] [error_field=<field>] [model=<string>] [cache=<bool>] [limit=<int>]
+decide prompt="<prompt>" [field=<field>] [output=<field>] [error_field=<field>] [model=<string>] [cache=<bool>] [limit=<int>]
 ```
 
 | Field | Default name | Value |
@@ -107,6 +108,7 @@ A quoted prompt can contain `=`, such as `decide "Is status=500 an error?"`.
 ```
 choose "<question>" <option> <description> <option> <description> [<option> <description> ...]
        [field=<field>] [output=<field>] [error_field=<field>] [model=<string>] [cache=<bool>]
+       [limit=<int>]
 ```
 
 The model picks the option that fits each event best. Give 2 to 255 options, each a distinct value followed by a description of when it applies. The description is sent to the model with the option and is required. Include a fallback option, such as `other "Anything else"`, when your options don't cover every event.
@@ -140,6 +142,7 @@ index=web
 ```
 grade "<question>" <level> <description> <level> <description> [<level> <description> ...]
       [field=<field>] [output=<field>] [error_field=<field>] [model=<string>] [cache=<bool>]
+      [limit=<int>]
 ```
 
 The model rates each event against levels that you give from lowest to highest, each a distinct label followed by a description of its criteria. Give at least 2 levels, and give adjacent levels clearly different criteria. The description is required.
@@ -205,10 +208,25 @@ A failure on one event never stops the search. If an event can't be decided, its
 | `timeout after <n>s` | The request timed out, after retries. |
 | `connection error: ...`, `proxy error: ...`, `TLS error: ...` | The request didn't reach the API, after retries. |
 | `invalid response: ...` | The API answered with something the add-on doesn't recognize. |
+| `limit of <n> API calls reached` | The search already sent `limit` requests, so no request was sent for this input. See [Limiting API calls](#limiting-api-calls). |
 
 After a 401, 403 or 404 (for example an invalid API key or a wrong base URL), the command stops calling the API for the rest of the search, and every remaining event gets the same error.
 
 Events whose output is empty fail a numeric `where` comparison, so `| where decision_probability > 0.8` also drops events that couldn't be decided. To keep and inspect them, add `OR isnotnull(decision_error)`.
+
+### Limiting API calls
+
+To guard against unexpected API spend on a large search, each command sends at most `limit` API requests per search, 1,000 by default. Only inputs that need a request count: cache hits, and inputs already answered earlier in the same search, don't. Retries of a failed request don't count either. The limit applies across the whole search, and the requests go to the first inputs that need one, in event order.
+
+Once the limit is reached, events are still kept. Events whose answer is in the cache still get it, and every other event gets empty output fields and `limit of <n> API calls reached` in `error_field`. The search shows one warning, such as `decide: limit of 1000 API calls reached, so events that needed another call were not decided. Raise the limit with limit=<number>, or use limit=0 for no limit.`
+
+```spl
+index=auth | decide "Is this a failed login?" limit=5000
+
+index=auth | decide "Is this a failed login?" limit=0
+```
+
+`limit=0` removes the limit. A negative limit fails the search with an error.
 
 ## Result cache
 
@@ -231,7 +249,7 @@ index=web
 
 ## Cost and latency
 
-- **Every event that isn't a cache hit is one API request.** The Decisions API bills input tokens only, at $0.10 per 1M input tokens at the time of writing; check OpenAI's current pricing. A live test request for one sshd log line used 191 input tokens with `decide`, 142 with a 4-option `choose` and 157 with a 3-level `grade`, so short log lines cost about $0.02 per 1,000 events. Long events, and long option and level descriptions, cost more. Put the command after your filtering commands, and use `head` or `sample` while you tune a question.
+- **Every distinct input that isn't a cache hit is one API request**, up to the [limit](#limiting-api-calls) of 1,000 per search by default. The Decisions API bills input tokens only, at $0.10 per 1M input tokens at the time of writing; check OpenAI's current pricing. A live test request for one sshd log line used 191 input tokens with `decide`, 142 with a 4-option `choose` and 157 with a 3-level `grade`, so short log lines cost about $0.02 per 1,000 events. Long events, and long option and level descriptions, cost more. Put the command after your filtering commands, and use `head` or `sample` while you tune a question.
 - **The commands are much slower than built-in commands.** Requests run in parallel up to the concurrency setting (default 4). In a live test, 5 uncached events took about 3 seconds end to end with `decide`, and a repeat run served entirely from the cache took about 0.5 seconds. Large searches take proportionally longer, and can hit your OpenAI rate limits. 429 responses are retried, then reported per event.
 - Raising the maximum concurrent requests speeds up large searches, but spends your rate limit faster, and applies separately to every search running at the same time.
 - Event text is sent to OpenAI. Make sure that's acceptable for the data you run the commands on.
@@ -240,6 +258,7 @@ index=web
 
 - `<command>: no OpenAI API key is configured`: set the key on the Configuration page.
 - `<command>: could not read the add-on settings ... list_storage_passwords`: your role can't read the stored API key. See [Permissions](#permissions).
+- `<command>: limit of <n> API calls reached`: the search needed more API requests than its `limit`, so some events weren't decided. Raise it with `limit=<number>`, or remove it with `limit=0`. See [Limiting API calls](#limiting-api-calls).
 - `<command> cache lookup failed`, `<command> cache write failed`, `<command> cache purge failed` or `<command> cache unavailable`: a KV store request for the result cache failed, and the message ends with the KV store's error. The search still completes, but without that part of the cache, so events that could have been cache hits are sent to the API.
 - Per-event errors, cache statistics, and each search's settings are logged to `$SPLUNK_HOME/var/log/splunk/ta_openai_decisions_decide.log`, `ta_openai_decisions_choose.log` and `ta_openai_decisions_grade.log`, which are indexed in `_internal`:
 

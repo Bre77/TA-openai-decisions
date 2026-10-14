@@ -17,7 +17,7 @@
 
     ... | grade "<question>" <label> <description> <label> <description> [...]
                 [field=<field>] [output=<field>] [error_field=<field>]
-                [model=<model>] [cache=<bool>]
+                [model=<model>] [cache=<bool>] [limit=<int>]
 
 Asks the API a score question. The levels go from lowest to highest. Adds the
 score (the probability-weighted average of the level indices, from 0 to the
@@ -43,6 +43,7 @@ class GradeCommand(QuestionCommand):
     ##Syntax
     grade <string> <string> <string> <string> <string>... [field=<field>]
     [output=<field>] [error_field=<field>] [model=<string>] [cache=<bool>]
+    [limit=<int>]
 
     ##Description
     Grades each event against ordered levels with the OpenAI Decisions API and
@@ -50,6 +51,8 @@ class GradeCommand(QuestionCommand):
     confidence, and the probability of each level. Events are never dropped.
     The question is the first argument, in double quotes, followed by two or
     more levels from lowest to highest, each a label and then its description.
+    At most limit API calls (default 1000, 0 for no limit) are made per search;
+    cache hits do not count.
     """
 
     FROM_CACHE_FIELD = "grade_from_cache"

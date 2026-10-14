@@ -17,7 +17,10 @@
 # key short-circuit, and that the API key never reaches a log. It then checks
 # the choose and grade commands: their output fields, per-event errors, a
 # repeat run served from the cache without touching decide's entries, quoted
-# options as Splunk delivers them, and their argument errors.
+# options as Splunk delivers them, and their argument errors. Last, it checks
+# the limit on API calls for all three commands with a warm cache: cached
+# rows are answered, uncached rows past the limit get the limit error and one
+# search warning, and the default limit of 1000.
 set -euo pipefail
 
 CONTAINER="${1:?usage: splunk_e2e.sh <container> <package.tar.gz>}"
@@ -344,6 +347,67 @@ expect "grade: repeat run calls the API only for uncached failures" \
   'data["by_input"] == {"REFUSE this": 1, "HTTP500 boom": 3, "BADJSON": 1}' "$rows" "$stats"
 expect "grade: repeat run has no cache warnings" 'not any("cache" in m["text"] for m in messages)' "$rows"
 
+log "limit: with a warm cache, cached rows are answered and uncached rows past the limit get the limit error"
+# "user bob login failed" and "user alice logged in" are cached for all three
+# commands by the runs above; the "limit new" inputs are not.
+LIMITED='| makeresults count=8 | streamstats count as n
+| eval _raw=case(n=1,"user bob login failed", n=2,"limit new 1", n=3,"user alice logged in", n=4,"limit new 2",
+                 n=5,"limit new 3", n=6,"limit new 1", n=7,"user bob login failed", n=8,"limit new 4")'
+LIMIT_WARNING='limit of 2 API calls reached, so events that needed another call were not decided. Raise the limit with limit=<number>, or use limit=0 for no limit.'
+stub_reset
+rows="$(search "$LIMITED | decide \"Is this a failed login?\" limit=2 | table n decision_probability decision_error decision_from_cache")"
+printf '%s\n' "$rows"
+stats="$(stub_stats)"
+expect "limit=2: all 8 events returned in order" '[r["n"] for r in rows] == [str(n) for n in range(1, 9)]' "$rows"
+expect "limit=2: cached rows answered, a repeat answered from memory, rows past the limit empty" \
+  '[r.get("decision_probability") for r in rows] == ["0.95","0.05","0.05","0.05",None,"0.05","0.95",None]' "$rows"
+expect "limit=2: rows past the limit get the limit error" \
+  '[r.get("decision_error") for r in rows] == [None,None,None,None,"limit of 2 API calls reached",None,None,"limit of 2 API calls reached"]' "$rows"
+expect "limit=2: decision_from_cache true on the cached rows only" \
+  '[r.get("decision_from_cache") for r in rows] == ["true","false","true","false","false","false","true","false"]' "$rows"
+expect "limit=2: only the first 2 uncached inputs call the API" \
+  'data["by_input"] == {"limit new 1": 1, "limit new 2": 1}' "$rows" "$stats"
+WANT="decide: $LIMIT_WARNING" expect "limit=2: one limit warning, and no per-event error warning" \
+  '[m["text"] for m in messages if "limit of" in m["text"] or "could not be decided" in m["text"]] == [os.environ["WANT"]]' "$rows"
+
+stub_reset
+rows="$(search "$LIMITED | decide \"Is this a failed login?\" limit=0 | table n decision_probability decision_error decision_from_cache")"
+stats="$(stub_stats)"
+expect "limit=0: every row answered" \
+  '[r.get("decision_probability") for r in rows] == ["0.95","0.05","0.05","0.05","0.05","0.05","0.95","0.05"] and not any(r.get("decision_error") for r in rows)' "$rows"
+expect "limit=0: the inputs answered under the limit were cached, the rest call the API" \
+  'data["by_input"] == {"limit new 3": 1, "limit new 4": 1}' "$rows" "$stats"
+expect "limit=0: no limit or per-event warnings" 'not any("limit of" in m["text"] or "could not be decided" in m["text"] for m in messages)' "$rows"
+
+for command in choose grade; do
+  if [ "$command" = choose ]; then question="$CHOOSE" field=choice; else question="$GRADE" field=grade; fi
+  stub_reset
+  rows="$(search "$LIMITED $question limit=2 | table n $field ${field}_error ${field}_from_cache")"
+  stats="$(stub_stats)"
+  F="$field" expect "$command limit=2: cached rows answered, rows past the limit get the limit error" \
+    '[(r.get(os.environ["F"]) is not None, r.get(os.environ["F"] + "_error"), r.get(os.environ["F"] + "_from_cache")) for r in rows] == [(True,None,"true"),(True,None,"false"),(True,None,"true"),(True,None,"false"),(False,"limit of 2 API calls reached","false"),(True,None,"false"),(True,None,"true"),(False,"limit of 2 API calls reached","false")]' "$rows"
+  expect "$command limit=2: only the first 2 uncached inputs call the API" \
+    'data["by_input"] == {"limit new 1": 1, "limit new 2": 1}' "$rows" "$stats"
+  WANT="$command: $LIMIT_WARNING" expect "$command limit=2: one limit warning" \
+    '[m["text"] for m in messages if "limit of" in m["text"] or "could not be decided" in m["text"]] == [os.environ["WANT"]]' "$rows"
+done
+
+log "limit: the default is 1000 API calls"
+stub_reset
+rows="$(search '| makeresults count=1003 | streamstats count as n | eval _raw="default limit ".n | decide "q?" cache=false | stats count(decision_probability) as decided count(eval(decision_error="limit of 1000 API calls reached")) as limited count as events')"
+# The full stats, with 1000 request bodies, are too long for an environment variable.
+stats="$(stub_stats | python3 -c '
+import json, sys
+stats = json.load(sys.stdin)
+print(json.dumps({"requests": stats["requests"], "events": sorted(int(i.split()[-1]) for i in stats["by_input"])}))')"
+printf '%s\n' "$rows"
+expect "default limit: 1000 decided and 3 limited, none dropped" \
+  'rows == [{"decided": "1000", "limited": "3", "events": "1003"}]' "$rows"
+expect "default limit: exactly 1000 requests, for the first 1000 events" \
+  'data == {"requests": 1000, "events": list(range(1, 1001))}' "$rows" "$stats"
+expect "default limit: the warning names the limit" \
+  'any(m["text"].startswith("decide: limit of 1000 API calls reached") for m in messages)' "$rows"
+
 log "choose: quoted arguments arrive as written"
 stub_reset
 rows="$(search '| makeresults | eval msg="x" | choose field=msg "Is status=500 \"bad\"?" "a, b" "Has, a comma" "c=d" "Has an =" "say \"e\"" "A \"quoted\" description" f,g cache=false | table choice choice_probability_a_b choice_probability_c_d choice_probability_say_e choice_probability_f choice_error')"
@@ -354,7 +418,7 @@ expect "choose: quoted values and descriptions with commas, = and escaped quotes
 expect "choose: field names for options with punctuation" \
   'len(rows) == 1 and rows[0].get("choice_error") is None and [rows[0].get(f) for f in ("choice_probability_a_b", "choice_probability_c_d", "choice_probability_say_e", "choice_probability_f")] == ["0.8", "0.0667", "0.0667", "0.0667"]' "$rows"
 
-log "choose and grade: argument mistakes fail the search with a clear message"
+log "argument mistakes fail the search with a clear message"
 for case in \
   '| makeresults | choose|choose: a double-quoted question and its options are required.' \
   '| makeresults | choose "Which team?" network Routers|choose: at least 2 options are required, but got 1.' \
@@ -363,8 +427,11 @@ for case in \
   '| makeresults | choose Which team? network Routers storage Disks|choose: put the question in double quotes.' \
   '| makeresults | grade "How bad?" low "Fine" high|grade: each level must be followed by its description, but got an odd number of terms (3)' \
   '| makeresults | grade "How bad?" low "Fine"|grade: at least 2 levels are required, but got 1.' \
-  '| makeresults | grade "How bad?" low "Fine" low "Bad"|grade: duplicate level '"'"'low'"'"'.'; do
-  spl="${case%%|choose:*}"; spl="${spl%%|grade:*}"; want="${case#"$spl|"}"
+  '| makeresults | grade "How bad?" low "Fine" low "Bad"|grade: duplicate level '"'"'low'"'"'.' \
+  '| makeresults | decide "q?" limit=-1|decide: limit must be a number of API calls, or 0 for no limit, but got -1' \
+  '| makeresults | choose "Which?" a A b B limit=-5|choose: limit must be a number of API calls, or 0 for no limit, but got -5' \
+  '| makeresults | grade "How bad?" low "Fine" high "Bad" limit=-1|grade: limit must be a number of API calls, or 0 for no limit, but got -1'; do
+  spl="${case%%|choose:*}"; spl="${spl%%|grade:*}"; spl="${spl%%|decide:*}"; want="${case#"$spl|"}"
   rows="$(search "$spl")"
   WANT="$want" expect "error: $want" 'any(os.environ["WANT"] in m["text"] and m["type"] in ("ERROR", "FATAL") for m in messages) and not rows' "$rows"
 done

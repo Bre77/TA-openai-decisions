@@ -42,7 +42,7 @@ from decision_cache import (
     KVStoreCache,
     describe_error,
 )
-from openai_decisions import DEFAULT_MODEL, DecisionsClient, Evaluator
+from openai_decisions import DEFAULT_LIMIT, DEFAULT_MODEL, DecisionsClient, Evaluator
 
 APP_NAME = "TA-openai-decisions"
 SETTINGS_CONF = "ta_openai_decisions_settings"
@@ -170,6 +170,12 @@ class QuestionCommand(StreamingCommand):
         default=None,
         validate=validators.Boolean(),
     )
+    limit = Option(
+        doc="Maximum OpenAI API calls the search makes; inputs answered from the cache do "
+        f"not count. 0 means no limit. Default: {DEFAULT_LIMIT}.",
+        default=DEFAULT_LIMIT,
+        validate=validators.Integer(),
+    )
 
     def _resolve_question(self):
         """Return the question object for the command's arguments, or _fail()."""
@@ -237,6 +243,11 @@ class QuestionCommand(StreamingCommand):
         self._question = self._resolve_question()
         if not (self.model or "").strip():
             self._fail('A non-empty value for "model" is required')
+        if self.limit < 0:
+            self._fail(
+                f"{self.name}: limit must be a number of API calls, or 0 for no limit, "
+                f"but got {self.limit}"
+            )
 
         try:
             settings = load_settings(self.metadata.searchinfo.session_key)
@@ -270,6 +281,7 @@ class QuestionCommand(StreamingCommand):
         self._start_args = (client, concurrency, ttl_days, max_entries, bool(proxies))
         self._evaluator = None
         self._warned = set()
+        self._limit_reached = False
 
     def _start(self):
         """Per-search setup, deferred to the first chunk: Splunk also runs
@@ -277,10 +289,16 @@ class QuestionCommand(StreamingCommand):
         client, concurrency, ttl_days, max_entries, proxied = self._start_args
         cache = self._make_cache(ttl_days, max_entries) if self._use_cache else None
         self._evaluator = Evaluator(
-            client, self._question, self.model, concurrency=concurrency, cache=cache
+            client,
+            self._question,
+            self.model,
+            concurrency=concurrency,
+            cache=cache,
+            limit=self.limit,
         )
         self._log.info(
-            "%s starting: sid=%s model=%s field=%s output=%s concurrency=%d proxy=%s cache=%s",
+            "%s starting: sid=%s model=%s field=%s output=%s concurrency=%d proxy=%s cache=%s "
+            "limit=%d",
             self.name,
             self.metadata.searchinfo.sid,
             self.model,
@@ -289,6 +307,7 @@ class QuestionCommand(StreamingCommand):
             concurrency,
             "on" if proxied else "off",
             "on" if cache else "off",
+            self.limit,
         )
 
     def _make_cache(self, ttl_days, max_entries):
@@ -327,7 +346,7 @@ class QuestionCommand(StreamingCommand):
     def stream(self, records):
         if self._evaluator is None:
             self._start()
-        total = failed = 0
+        total = failed = limited = 0
         for record, answer, error, from_cache in self._evaluator.evaluate(records, self._text):
             total += 1
             # Set the fields on every record so the chunk header always carries them.
@@ -335,15 +354,19 @@ class QuestionCommand(StreamingCommand):
             record[self.error_field] = error
             if self._use_cache:
                 record[self.FROM_CACHE_FIELD] = "true" if from_cache else "false"
-            if error is not None:
+            if error is not None and error == self._evaluator.limit_error:
+                limited += 1
+                self._report_limit()
+            elif error is not None:
                 failed += 1
                 self._report(error)
             yield record
         self._log.info(
-            "%s chunk done: events=%d errors=%d api_calls=%d cache_hits=%d cached=%d",
+            "%s chunk done: events=%d errors=%d limited=%d api_calls=%d cache_hits=%d cached=%d",
             self.name,
             total,
             failed,
+            limited,
             self._evaluator.stats.get("api_calls", 0),
             self._evaluator.stats.get("cache_hits", 0),
             self._evaluator.stats.get("cached", 0),
@@ -366,6 +389,18 @@ class QuestionCommand(StreamingCommand):
             self._warned.add(error)
         if len(self._warned) <= MAX_UI_WARNINGS:
             self.write_warning(self.name + ": some events could not be decided: {}", error)
+
+    def _report_limit(self):
+        # One warning per search, however many events and chunks the limit affects.
+        if self._limit_reached:
+            return
+        self._limit_reached = True
+        message = (
+            f"{self.name}: {self._evaluator.limit_error}, so events that needed another call "
+            "were not decided. Raise the limit with limit=<number>, or use limit=0 for no limit."
+        )
+        self._log.warning(message)
+        self.write_warning("{}", message)
 
     def _fail(self, message):
         logger = getattr(self, "_log", None)

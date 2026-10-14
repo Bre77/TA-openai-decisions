@@ -312,6 +312,54 @@ def test_evaluator_bounds_requests_ahead_of_the_consumer():
     assert len(started) <= 2 * 4 + 2
 
 
+def test_evaluator_limit_counts_requests_across_chunks(stub):
+    evaluator = Evaluator(make_client(stub), "q", concurrency=4, limit=3)
+    assert run(evaluator, ["a fail", "b", "a fail"]) == [(0.95, None), (0.05, None), (0.95, None)]
+    assert evaluator.stats["limited"] == 0
+    # "b" and "a fail" are answered from memory and do not count.
+    assert run(evaluator, ["c", "b", "d", "a fail", "e", "d"]) == [
+        (0.05, None),
+        (0.05, None),
+        (None, "limit of 3 API calls reached"),
+        (0.95, None),
+        (None, "limit of 3 API calls reached"),
+        (None, "limit of 3 API calls reached"),
+    ]
+    assert stub.state.by_input == {"a fail": 1, "b": 1, "c": 1}
+    assert (evaluator.stats["api_calls"], evaluator.stats["limited"]) == (1, 2)
+    # Past the limit an input is not retried in a later chunk either.
+    assert run(evaluator, ["d"]) == [(None, "limit of 3 API calls reached")]
+    assert stub.state.requests == 3
+
+
+@pytest.mark.parametrize("concurrency", [1, 4, 16])
+def test_evaluator_never_sends_more_than_the_limit(stub, concurrency):
+    evaluator = Evaluator(make_client(stub), "q", concurrency=concurrency, limit=5)
+    results = run(evaluator, [f"event {i}" for i in range(50)])
+    # The first 5 distinct inputs, in event order, are the ones decided.
+    assert results == [(0.05, None)] * 5 + [(None, "limit of 5 API calls reached")] * 45
+    assert stub.state.requests == 5
+    assert evaluator.limit_error == "limit of 5 API calls reached"
+
+
+@pytest.mark.parametrize("limit", [0, None])
+def test_evaluator_limit_zero_or_none_is_unlimited(stub, limit):
+    evaluator = Evaluator(make_client(stub), "q", concurrency=4, limit=limit)
+    assert run(evaluator, [f"event {i}" for i in range(30)]) == [(0.05, None)] * 30
+    assert stub.state.requests == 30
+    assert evaluator.limit_error is None
+
+
+def test_evaluator_limit_does_not_count_retries(stub):
+    evaluator = Evaluator(make_client(stub, max_retries=2), "q", concurrency=1, limit=2)
+    assert run(evaluator, ["HTTP500", "b", "c"]) == [
+        (None, "HTTP 500: The server had an error while processing your request."),
+        (0.05, None),
+        (None, "limit of 2 API calls reached"),
+    ]
+    assert stub.state.by_input == {"HTTP500": 3, "b": 1}
+
+
 def test_evaluator_contains_unexpected_exceptions():
     class BrokenClient:
         def decide(self, prompt, text, model):
