@@ -17,7 +17,7 @@
 
     ... | choose "<question>" <option> <description> <option> <description> [...]
                  [field=<field>] [output=<field>] [error_field=<field>]
-                 [model=<model>] [cache=<bool>] [limit=<int>]
+                 [model=<model>] [cache=<bool>] [limit=<int>] [distributed=<bool>]
 
 Asks a choice question and adds the chosen option, its probability, the
 answer's confidence and every option's probability to each event. Events are
@@ -42,7 +42,7 @@ class ChooseCommand(QuestionCommand):
     ##Syntax
     choose <string> <string> <string> <string> <string>... [field=<field>]
     [output=<field>] [error_field=<field>] [model=<string>] [cache=<bool>]
-    [limit=<int>]
+    [limit=<int>] [distributed=<bool>]
 
     ##Description
     Asks the OpenAI Decisions API which of the options fits each event and adds
@@ -50,7 +50,9 @@ class ChooseCommand(QuestionCommand):
     each option. Events are never dropped. The question is the first argument,
     in double quotes, followed by two or more options, each a value and then
     its description. At most limit API calls (default 1000, 0 for no limit)
-    are made per search; cache hits do not count.
+    are made per search; cache hits do not count. With distributed=true, the
+    indexers also run the command and call the API themselves, without the
+    cache or the limit.
     """
 
     FROM_CACHE_FIELD = "choice_from_cache"

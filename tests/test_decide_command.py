@@ -254,6 +254,7 @@ def start_with_cache(monkeypatch, service):
     command._evaluator = None
     command._question = Predicate("q")
     command._start_args = (FakeClient(), 1, 7, 1000, False)
+    command._call_limit = 1000
     command._metadata = types.SimpleNamespace(
         searchinfo=types.SimpleNamespace(
             splunkd_uri="https://127.0.0.1:8089", session_key="s", sid="1"
