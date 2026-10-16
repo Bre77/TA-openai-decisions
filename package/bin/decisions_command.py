@@ -19,18 +19,23 @@ streaming each chunk through the evaluator.
 
 Each command module declares its own options and question and is written by
 hand rather than generated from globalConfig ``customSearchCommand``, because
-the commands must declare ``distributed=False`` so they run once on the search
-head (where the API key and proxy settings live) instead of fanning API calls
-out from every indexer.
+the commands declare ``distributed=False``: by default they run once on the
+search head, where the API key and proxy settings live, instead of fanning API
+calls out from every indexer. ``distributed=true`` turns distribution on for
+one search, and a search peer then reads the settings from its knowledge
+bundle copy of the add-on (see default/distsearch.conf) or from its own
+configuration.
 """
 
+import json
 import logging
+import os
 import re
 import sys
 from urllib.parse import quote, urlsplit
 
 import import_declare_test  # noqa: F401  (puts the add-on's lib/ on sys.path)
-from solnlib import conf_manager, log
+from solnlib import conf_manager, credentials, log
 from solnlib.utils import is_true
 from splunklib import client as splunk_client
 from splunklib.searchcommands import Option, StreamingCommand, validators
@@ -48,6 +53,11 @@ APP_NAME = "TA-openai-decisions"
 SETTINGS_CONF = "ta_openai_decisions_settings"
 SETTINGS_REALM = f"__REST_CREDENTIAL__#{APP_NAME}#configs/conf-{SETTINGS_CONF}"
 LOG_NAMESPACE = "ta_openai_decisions"
+SETTINGS_STANZAS = ("openai", "cache", "proxy", "logging")
+# The add-on's directory; on a search peer, its copy in the knowledge bundle.
+APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# A search peer runs a distributed search under a sid with this prefix.
+PEER_SID_PREFIX = "remote_"
 
 # An argument of this form, unless Splunk saw it quoted, is an option.
 OPTION_ARG = re.compile(r"[A-Za-z_]\w*=")
@@ -71,6 +81,10 @@ PROXY_SCHEMES = {
 
 class SettingsError(Exception):
     pass
+
+
+class BundleSettingsError(SettingsError):
+    """The settings could not be read from the search peer's knowledge bundle."""
 
 
 def build_proxies(proxy):
@@ -102,14 +116,160 @@ def load_settings(session_key):
     try:
         cfm = conf_manager.ConfManager(session_key, APP_NAME, realm=SETTINGS_REALM)
         conf = cfm.get_conf(SETTINGS_CONF)
-        return {name: _get_stanza(conf, name) for name in ("openai", "cache", "proxy", "logging")}
+        return {name: _get_stanza(conf, name) for name in SETTINGS_STANZAS}
     except SettingsError:
         raise
     except Exception as e:
         raise SettingsError(
             f"could not read the add-on settings ({type(e).__name__}: {e}). Reading the "
-            "stored API key requires the list_storage_passwords capability."
+            "stored API key requires the list_storage_passwords and list_settings capabilities."
         ) from e
+
+
+def load_peer_settings(session_key, app_dir=APP_DIR, decrypt=None):
+    """Read the settings on a search peer that runs a distributed search.
+
+    The settings and secrets configured on the search head reach the peer in
+    the knowledge bundle, but only a peer that shares the search head's
+    splunk.secret can decrypt them. Otherwise the peer's own configuration is
+    used, which exists when the add-on is installed and configured on it.
+    Returns the settings and where they came from.
+    """
+    try:
+        return load_bundle_settings(app_dir, decrypt or splunk_decrypt), "the knowledge bundle"
+    except BundleSettingsError as e:
+        bundle_error = e
+    try:
+        settings = load_settings(session_key)
+    except SettingsError:
+        settings = None
+    if settings and settings["openai"].get("api_key"):
+        return settings, f"this search peer's configuration, because {bundle_error}"
+    raise SettingsError(
+        f"{bundle_error}, and the add-on isn't configured on this search peer. For "
+        "distributed=true, indexers need the search head's splunk.secret, or the add-on "
+        "installed and configured on each one."
+    )
+
+
+def load_bundle_settings(app_dir, decrypt):
+    """Read the settings from the add-on's own files, as the knowledge bundle
+    replicates them to a search peer, and decrypt the stored secrets with
+    ``decrypt``. Raises BundleSettingsError when there is no API key to use."""
+    stanzas = {}
+    for layer in ("default", "local"):
+        path = os.path.join(app_dir, layer, SETTINGS_CONF + ".conf")
+        for name, values in read_conf(path).items():
+            stanzas.setdefault(name, {}).update(values)
+    stored = _stored_credentials(read_conf(os.path.join(app_dir, "local", "passwords.conf")))
+    settings = {}
+    for name in SETTINGS_STANZAS:
+        stanza = stanzas.get(name, {})
+        encrypted = [k for k, v in stanza.items() if v == conf_manager.ConfFile.ENCRYPTED_TOKEN]
+        if encrypted:
+            if name not in stored:
+                secret = "API key" if name == "openai" else f"{name} password"
+                raise BundleSettingsError(f"the knowledge bundle has no {secret}")
+            secrets = _decrypt_credential(stored[name], decrypt)
+            stanza = {**stanza, **{k: secrets.get(k) for k in encrypted}}
+        settings[name] = stanza
+    if not settings["openai"].get("api_key"):
+        raise BundleSettingsError("the knowledge bundle has no API key")
+    return settings
+
+
+def read_conf(path):
+    """Parse a Splunk .conf file into ``{stanza: {key: value}}``; a missing file is empty."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except FileNotFoundError:
+        return {}
+    stanzas = {}
+    stanza = stanzas.setdefault("default", {})
+    while lines:
+        line = lines.pop(0).strip()
+        # A backslash at the end of a line continues the value on the next line.
+        while line.endswith("\\") and lines:
+            line = line[:-1] + "\n" + lines.pop(0).strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            stanza = stanzas.setdefault(line[1:-1], {})
+        elif "=" in line:
+            key, value = line.split("=", 1)
+            stanza[key.strip()] = value.strip()
+    return stanzas
+
+
+def _stored_credentials(passwords):
+    """The add-on's encrypted credentials in a parsed passwords.conf, as
+    ``{settings stanza: {part index: encrypted value}}``.
+
+    solnlib stores the secrets of each settings stanza as one JSON value, split
+    into parts named ``<stanza>``splunk_cred_sep``<index>`` and ended by a part
+    that holds its end mark. Older versions stored the whole value under the
+    stanza name, which becomes part 0 when there are no parts.
+    """
+    stored = {}
+    whole = {}
+    for name, values in passwords.items():
+        # [credential:<realm>:<username>:], with any ":" in the names escaped as "\:".
+        fields = re.split(r"(?<!\\):", name)
+        if len(fields) != 4 or fields[0] != "credential" or fields[3]:
+            continue
+        realm, user = (field.replace("\\:", ":") for field in fields[1:3])
+        if realm != SETTINGS_REALM or not values.get("password"):
+            continue
+        stanza, sep, index = user.partition(credentials.CredentialManager.SEP)
+        if not sep:
+            whole[stanza] = values["password"]
+        elif index.isdigit():
+            stored.setdefault(stanza, {})[int(index)] = values["password"]
+    for stanza, value in whole.items():
+        stored.setdefault(stanza, {0: value})
+    return stored
+
+
+def _decrypt_credential(parts, decrypt):
+    """Decrypt and join a stored credential's parts, and parse its JSON fields."""
+    clear = []
+    for index in sorted(parts):
+        value = decrypt(parts[index])
+        if value is None:
+            raise BundleSettingsError("could not decrypt the API key from the search head")
+        if value == credentials.CredentialManager.END_MARK:
+            break
+        clear.append(value)
+    try:
+        fields = json.loads("".join(clear))
+    except ValueError:
+        fields = None
+    if not isinstance(fields, dict):
+        raise BundleSettingsError("could not decrypt the API key from the search head")
+    return fields
+
+
+def splunk_decrypt(value):
+    """Decrypt a value encrypted with this instance's splunk.secret, or return None.
+
+    Uses Splunk's own helper, which runs ``splunk show-decrypted`` with the
+    value in its environment rather than its arguments. It is internal to
+    Splunk, so any failure is a failed decryption. It logs the value when it
+    fails, so its logger is silenced for the call.
+    """
+    helper_logger = logging.getLogger("splunk.clilib.cli_common")
+    disabled = helper_logger.disabled
+    helper_logger.disabled = True
+    try:
+        from splunk.clilib import cli_common
+
+        return cli_common.decrypt(value, setEnv=True)
+    except Exception:
+        return None
+    finally:
+        helper_logger.disabled = disabled
+        os.environ.pop("ENCRYPTED_PASSWORD", None)
 
 
 def _get_stanza(conf, name):
@@ -175,6 +335,12 @@ class QuestionCommand(StreamingCommand):
         f"not count. 0 means no limit. Default: {DEFAULT_LIMIT}.",
         default=DEFAULT_LIMIT,
         validate=validators.Integer(),
+    )
+    distributed = Option(
+        doc="Also run the command on the indexers, which call the API themselves. Turns off "
+        "the cache, and can't be used with limit. Default: false.",
+        default=False,
+        validate=validators.Boolean(),
     )
 
     def _resolve_question(self):
@@ -248,11 +414,34 @@ class QuestionCommand(StreamingCommand):
                 f"{self.name}: limit must be a number of API calls, or 0 for no limit, "
                 f"but got {self.limit}"
             )
+        info = self.metadata.searchinfo
+        # A search peer runs the command only when the search head distributed it,
+        # and must then report it as distributed too.
+        on_peer = (info.sid or "").startswith(PEER_SID_PREFIX)
+        distributed = on_peer or bool(self.distributed)
+        self.configuration.distributed = distributed
+        if distributed and self.cache:
+            self._fail(
+                f"{self.name}: cache=true can't be used with distributed=true, because each "
+                "indexer would have its own cache. Remove cache=true."
+            )
+        if distributed and self.options["limit"].is_set:
+            self._fail(
+                f"{self.name}: limit can't be used with distributed=true, because each indexer "
+                "would count only its own API calls. Remove limit."
+            )
 
         try:
-            settings = load_settings(self.metadata.searchinfo.session_key)
+            # On the search head the settings are read as the user, so a user who
+            # can't read the API key can't start a distributed search either.
+            if on_peer:
+                settings, source = load_peer_settings(info.session_key)
+            else:
+                settings, source = load_settings(info.session_key), None
             openai = settings["openai"]
             self._log = _make_logger(settings["logging"].get("loglevel"), self.name)
+            if source:
+                self._log.info("%s on a search peer: settings from %s", self.name, source)
             api_key = openai.get("api_key")
             if not api_key:
                 raise SettingsError(
@@ -277,7 +466,8 @@ class QuestionCommand(StreamingCommand):
         use_cache = self.cache
         if use_cache is None:
             use_cache = is_true(cache_settings.get("cache_enabled") or "1")
-        self._use_cache = use_cache
+        self._use_cache = use_cache and not distributed
+        self._call_limit = 0 if distributed else self.limit
         self._start_args = (client, concurrency, ttl_days, max_entries, bool(proxies))
         self._evaluator = None
         self._warned = set()
@@ -294,11 +484,11 @@ class QuestionCommand(StreamingCommand):
             self.model,
             concurrency=concurrency,
             cache=cache,
-            limit=self.limit,
+            limit=self._call_limit,
         )
         self._log.info(
             "%s starting: sid=%s model=%s field=%s output=%s concurrency=%d proxy=%s cache=%s "
-            "limit=%d",
+            "limit=%d distributed=%s",
             self.name,
             self.metadata.searchinfo.sid,
             self.model,
@@ -307,7 +497,8 @@ class QuestionCommand(StreamingCommand):
             concurrency,
             "on" if proxied else "off",
             "on" if cache else "off",
-            self.limit,
+            self._call_limit,
+            "on" if self.configuration.distributed else "off",
         )
 
     def _make_cache(self, ttl_days, max_entries):

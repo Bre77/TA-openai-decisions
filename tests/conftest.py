@@ -32,16 +32,22 @@ def splunk_args(raw_args):
     ]
 
 
-def run_getinfo(monkeypatch, command_class, raw_args):
+SETTINGS = {"openai": {"api_key": "k"}, "cache": {}, "proxy": {}, "logging": {}}
+
+
+def run_getinfo(monkeypatch, command_class, raw_args, sid="1"):
     """Run the protocol v2 getinfo exchange the way splunkd starts the command,
     and return the command and the error messages it wrote."""
+    command, reply = getinfo(monkeypatch, command_class, raw_args, sid)
+    messages = reply.get("inspector", {}).get("messages", [])
+    return command, [text for level, text in messages if level == "ERROR"]
+
+
+def getinfo(monkeypatch, command_class, raw_args, sid="1", load_settings=lambda key: SETTINGS):
+    """Run the getinfo exchange, and return the command and its reply metadata."""
     import decisions_command
 
-    monkeypatch.setattr(
-        decisions_command,
-        "load_settings",
-        lambda key: {"openai": {"api_key": "k"}, "cache": {}, "proxy": {}, "logging": {}},
-    )
+    monkeypatch.setattr(decisions_command, "load_settings", load_settings)
     monkeypatch.setattr(
         decisions_command, "_make_logger", lambda level, command: logging.getLogger("test")
     )
@@ -50,7 +56,7 @@ def run_getinfo(monkeypatch, command_class, raw_args):
         "args": splunk_args(raw_args),
         "raw_args": raw_args,
         "session_key": "s",
-        "sid": "1",
+        "sid": sid,
         "app": "search",
         "owner": "admin",
         "username": "admin",
@@ -69,10 +75,7 @@ def run_getinfo(monkeypatch, command_class, raw_args):
     except SystemExit:  # the command exits after reporting an error
         pass
     header, _, body = ofile.getvalue().decode().partition("\n")
-    messages = (
-        json.loads(body[: int(header.split(",")[1])]).get("inspector", {}).get("messages", [])
-    )
-    return command, [text for level, text in messages if level == "ERROR"]
+    return command, json.loads(body[: int(header.split(",")[1])])
 
 
 @pytest.fixture
