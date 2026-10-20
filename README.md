@@ -280,7 +280,7 @@ Build with Python 3.9 so the vendored libraries resolve for Splunk's oldest supp
 ```bash
 uv venv --seed --python 3.9 .venv-ucc && source .venv-ucc/bin/activate
 pip install splunk-add-on-ucc-framework==6.5.3
-./build.sh 1.2.0      # writes output/TA-openai-decisions and dist/TA-openai-decisions-1.2.0.tar.gz
+./build.sh 1.2.1      # writes output/TA-openai-decisions and dist/TA-openai-decisions-1.2.1.tar.gz
 ```
 
 `ucc-gen build` rewrites `globalConfig.json`. Commit any change it makes.
@@ -296,7 +296,7 @@ ruff check package/bin tests && ruff format --check package/bin tests
 The unit tests use a local stand-in for the Decisions API, `tests/stub_decisions_api.py`, and an in-memory KV store. `tests/e2e/splunk_e2e.sh` installs a built package into a running `splunk/splunk` container (admin password `devcontainer`), points the add-on at the stub, and checks the commands end to end, including the cache. The KV store REST API differs between Splunk versions, so run it on the oldest and the newest supported Splunk:
 
 ```bash
-tests/e2e/splunk_e2e.sh <container> dist/TA-openai-decisions-1.2.0.tar.gz
+tests/e2e/splunk_e2e.sh <container> dist/TA-openai-decisions-1.2.1.tar.gz
 ```
 
 ## Releasing
