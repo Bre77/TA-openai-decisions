@@ -17,7 +17,7 @@
 
     ... | decide "<question>" [field=<field>] [output=<field>]
                  [error_field=<field>] [model=<model>] [cache=<bool>]
-                 [limit=<int>]
+                 [limit=<int>] [distributed=<bool>]
 
 The question can also be given as ``prompt="<question>"``. Adds the predicate
 probability to every event and never drops events; filtering is left to a
@@ -41,14 +41,15 @@ class DecideCommand(QuestionCommand):
     """
     ##Syntax
     decide (<string> | prompt=<string>) [field=<field>] [output=<field>]
-    [error_field=<field>] [model=<string>] [cache=<bool>] [limit=<int>]
+    [error_field=<field>] [model=<string>] [cache=<bool>] [limit=<int>] [distributed=<bool>]
 
     ##Description
     Asks the OpenAI Decisions API a yes/no question about each event and adds the
     predicate probability (0 to 1) as a field. Events are never dropped. The
     question is the first argument, in double quotes, or the prompt option.
     At most limit API calls (default 1000, 0 for no limit) are made per search;
-    cache hits do not count.
+    cache hits do not count. With distributed=true, the indexers also run the
+    command and call the API themselves, without the cache or the limit.
     """
 
     FROM_CACHE_FIELD = "decision_from_cache"
